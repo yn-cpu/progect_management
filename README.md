@@ -1,1218 +1,453 @@
-
-"""CLI entry point for deeptrace."""
+"""Joern backend: runs Joern inside Docker to extract CPG and dataflow."""
 
 from __future__ import annotations
 
+import json
 import logging
 import os
-import sys
+import re
+import subprocess
+import tempfile
+import time
+from pathlib import Path
+from typing import Any
 
-import click
-from rich.console import Console
-from rich.logging import RichHandler
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
+from deeptrace.models.config import JoernConfig
+from deeptrace.models.graph import (
+    BackendKind,
+    EdgeKind,
+    GraphEdge,
+    GraphNode,
+    Language,
+    NodeKind,
+    SourceLocation,
+)
 
-from deeptrace.models.config import DeeptraceConfig
+logger = logging.getLogger(__name__)
 
-console = Console()
+# ---------------------------------------------------------------------------
+# Language detection
+# ---------------------------------------------------------------------------
+
+_EXT_MAP: dict[str, Language] = {
+    ".c": Language.C, ".h": Language.C,
+    ".cc": Language.CPP, ".cpp": Language.CPP, ".cxx": Language.CPP,
+    ".hh": Language.CPP, ".hpp": Language.CPP, ".hxx": Language.CPP,
+    ".java": Language.JAVA,
+    ".kt": Language.KOTLIN, ".kts": Language.KOTLIN,
+    ".py": Language.PYTHON,
+    ".swift": Language.SWIFT,
+    ".rs": Language.RUST,
+    ".m": Language.OBJC, ".mm": Language.OBJC,
+}
+
+_JOERN_LANG: dict[Language, str] = {
+    Language.C: "NEWC",
+    Language.CPP: "NEWC",
+    Language.JAVA: "JAVASRC",
+    Language.KOTLIN: "KOTLIN",
+    Language.SWIFT: "SWIFTSRC",
+}
+
+JOERN_PRIMARY: set[Language] = {Language.C, Language.CPP, Language.JAVA, Language.KOTLIN, Language.SWIFT}
 
 
-def _setup_logging(verbose: bool) -> None:
-    level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(message)s",
-        handlers=[RichHandler(console=console, show_path=False, show_time=False)],
-    )
-    # Quiet noisy libraries
-    for name in ("docker", "urllib3", "httpx", "httpcore"):
-        logging.getLogger(name).setLevel(logging.WARNING)
+def detect_language(target_file: str) -> Language | None:
+    ext = Path(target_file).suffix.lower()
+    return _EXT_MAP.get(ext)
+
+
+def is_joern_primary(lang: Language | None) -> bool:
+    return lang is not None and lang in JOERN_PRIMARY
 
 
 # ---------------------------------------------------------------------------
-# CLI group
+# Joern script templates
 # ---------------------------------------------------------------------------
 
-@click.group()
-@click.version_option(package_name="deeptrace-aco")
-def cli() -> None:
-    """deeptrace — Deep dependency trace analysis using Joern + ACO."""
-    pass
-
-
-# ---------------------------------------------------------------------------
-# trace command
-# ---------------------------------------------------------------------------
-
-@cli.command()
-@click.option("--repo", required=True, help="Path to the source repository.")
-@click.option("--target", required=True, help="Sink file:line (e.g. src/foo.c:123).")
-@click.option("--source", default="", help="Source file:line to trace FROM (e.g. src/input.c:42). Finds paths source->sink.")
-@click.option("--out", default="traces.json", help="Output JSON file.")
-@click.option("--language", default=None, help="Override language detection (c/cpp/java/kotlin/swift/rust/objc).")
-@click.option("--max-depth", default=30, type=int, help="Max backward trace depth.")
-@click.option("--max-flows", default=400, type=int, help="Max Joern flows to extract.")
-@click.option("--topk", default=50, type=int, help="Number of top paths in output.")
-@click.option("--ants", default=80, type=int, help="ACO: number of ants.")
-@click.option("--iterations", default=60, type=int, help="ACO: number of iterations.")
-@click.option("--alpha", default=1.0, type=float, help="ACO: pheromone importance.")
-@click.option("--beta", default=2.5, type=float, help="ACO: heuristic importance.")
-@click.option("--rho", default=0.15, type=float, help="ACO: evaporation rate.")
-@click.option("--interactive/--no-interactive", default=False, help="Enter interactive branch-selection mode.")
-@click.option("--session-file", default="", help="Path to save/resume session state.")
-@click.option("--llm/--no-llm", "llm_enabled", default=True, help="Enable LLM-based ranking.")
-@click.option("--llm-provider", type=click.Choice(["ollama", "anthropic", "openai"]), default="ollama", help="LLM provider.")
-@click.option("--llm-model", default="qwen3-coder:30b", help="LLM model name (e.g. qwen3-coder:30b, llama3.1:8b, claude-sonnet-4-20250514).")
-@click.option("--llm-base-url", default="", help="LLM API base URL (default: http://localhost:11434 for Ollama).")
-@click.option("--llm-api-key", default="", help="API key (not needed for Ollama).")
-@click.option("--z3/--no-z3", "z3_enabled", default=True, help="Enable Z3 constraint satisfiability checking.")
-@click.option("--enumerate-small-graphs/--no-enumerate-small-graphs", default=True, help="Exact enumeration for small graphs.")
-@click.option("--docker-image", default="ghcr.io/joernio/joern:nightly", help="Joern Docker image.")
-@click.option("--cpg-timeout", default=7200, type=int, help="Joern CPG generation timeout in seconds.")
-@click.option("--cpg-save", default="", help="Save Joern CPG to this path for reuse (e.g. repo.cpg.bin).")
-@click.option("--cpg-load", default="", help="Load a pre-built CPG instead of generating (skips joern-parse).")
-@click.option("--joern-memory", default="12g", help="Docker container memory limit for Joern (default: 12g).")
-@click.option("--jvm-heap", default="8g", help="JVM max heap for joern-parse and queries (default: 8g). Must be less than --joern-memory.")
-@click.option("--max-files", default=5000, type=int, help="Max source files for tree-sitter to scan (0=unlimited).")
-@click.option("--max-caller-hops", default=3, type=int, help="Cross-file caller expansion depth (0=disabled).")
-@click.option("--no-treesitter", is_flag=True, default=False, help="Disable tree-sitter fallback.")
-@click.option("-v", "--verbose", is_flag=True, default=False, help="Enable debug logging.")
-def trace(
-    repo: str,
-    target: str,
-    source: str,
-    out: str,
-    language: str | None,
-    max_depth: int,
-    max_flows: int,
-    topk: int,
-    ants: int,
-    iterations: int,
-    alpha: float,
-    beta: float,
-    rho: float,
-    interactive: bool,
-    session_file: str,
-    llm_enabled: bool,
-    llm_provider: str,
-    llm_model: str,
-    llm_base_url: str,
-    llm_api_key: str,
-    z3_enabled: bool,
-    enumerate_small_graphs: bool,
-    docker_image: str,
-    cpg_timeout: int,
-    cpg_save: str,
-    cpg_load: str,
-    joern_memory: str,
-    jvm_heap: str,
-    max_files: int,
-    max_caller_hops: int,
-    no_treesitter: bool,
-    verbose: bool,
-) -> None:
-    """Trace deep dependencies backward from a target (sink) file:line."""
-    _setup_logging(verbose)
-
-    # Build config
-    config = DeeptraceConfig(
-        repo=repo,
-        target=target,
-        source=source,
-        out=out,
-        language=language,
-        max_depth=max_depth,
-        max_flows=max_flows,
-        topk=topk,
-        interactive=interactive,
-        session_file=session_file,
-        enumerate_small_graphs=enumerate_small_graphs,
-    )
-    config.aco.ants = ants
-    config.aco.iterations = iterations
-    config.aco.alpha = alpha
-    config.aco.beta = beta
-    config.aco.rho = rho
-    config.joern.docker_image = docker_image
-    config.joern.cpg_timeout = cpg_timeout
-    config.joern.memory_limit = joern_memory
-    config.joern.jvm_heap = jvm_heap
-    if cpg_save:
-        config.joern.cpg_save_path = cpg_save
-    if cpg_load:
-        config.joern.cpg_load_path = cpg_load
-    config.treesitter.enabled = not no_treesitter
-    config.treesitter.max_files = max_files
-    config.max_caller_hops = max_caller_hops
-    config.llm.enabled = llm_enabled
-    if llm_provider:
-        from deeptrace.models.config import LLMProvider
-        config.llm.provider = LLMProvider(llm_provider)
-    config.llm.model = llm_model
-    if llm_base_url:
-        config.llm.base_url = llm_base_url
-    if llm_api_key:
-        config.llm.api_key = llm_api_key
-    config.z3.enabled = z3_enabled
-
-    # Run
-    from deeptrace.core.orchestrator import TraceOrchestrator
-
-    console.print(f"\n[bold]deeptrace[/bold] v1.0.0 — tracing [cyan]{target}[/cyan] in [cyan]{repo}[/cyan]")
-    if source:
-        console.print(f"  Source (from): [green]{source}[/green]")
-    console.print()
-
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TextColumn("{task.percentage:>3.0f}%"),
-        console=console,
-    ) as progress:
-        task = progress.add_task("Initializing...", total=100)
-
-        def on_progress(stage: str, pct: float) -> None:
-            labels = {
-                "detecting_language": "Detecting language...",
-                "extracting_graph": "Extracting dependency graph (Joern + tree-sitter)...",
-                "expanding_frontiers": "Expanding cross-file caller frontiers...",
-                "finding_target": "Locating target nodes...",
-                "exploring_paths": "Running ACO path exploration...",
-                "z3_checking": "Checking path satisfiability (Z3)...",
-                "collapsing_statements": "Collapsing to statement-level flows...",
-                "llm_ranking": "Ranking paths with LLM...",
-                "building_output": "Building output...",
-                "done": "Complete!",
-            }
-            progress.update(task, description=labels.get(stage, stage), completed=pct * 100)
-
-        try:
-            orchestrator = TraceOrchestrator(config)
-            output = orchestrator.run(progress_callback=on_progress)
-        except Exception as exc:
-            progress.stop()
-            console.print(f"\n[bold red]Error:[/bold red] {exc}")
-            if verbose:
-                import traceback
-                traceback.print_exc()
-            sys.exit(1)
-
-    # Display results
-    console.print(f"\n[bold green]Trace complete![/bold green]")
-    console.print(f"  Nodes: {output.node_count}")
-    console.print(f"  Edges: {output.edge_count}")
-    console.print(f"  Paths found: {len(output.paths)}")
-    if source:
-        console.print(f"  Mode: [cyan]source-sink[/cyan] ({source} -> {target})")
-
-    # Z3 summary
-    if z3_enabled and output.paths:
-        sat = sum(1 for p in output.paths if p.is_satisfiable is True)
-        unsat = sum(1 for p in output.paths if p.is_satisfiable is False)
-        unknown = sum(1 for p in output.paths if p.is_satisfiable is None)
-        console.print(f"  Z3: [green]{sat} SAT[/green], [red]{unsat} UNSAT[/red], [yellow]{unknown} unknown[/yellow]")
-
-    console.print(f"  Output: {out}")
-
-    if output.metadata.get("branch_points_detected", 0) > 0:
-        bp_count = output.metadata["branch_points_detected"]
-        console.print(f"  Branch points: [yellow]{bp_count}[/yellow]")
-
-    # Interactive mode
-    if interactive and output.paths:
-        from deeptrace.cli.interactive import interactive_session
-
-        branch_points = []
-        if hasattr(orchestrator, '_aco_explorer') and orchestrator._aco_explorer:
-            branch_points = orchestrator._aco_explorer.branch_points
-        interactive_session(output.paths, branch_points)
-
-    # Show top paths
-    if output.paths and not interactive:
-        from deeptrace.cli.interactive import display_paths_summary
-        console.print()
-        display_paths_summary(output.paths[:10])
-
-    console.print()
-
-
-# ---------------------------------------------------------------------------
-# session command
-# ---------------------------------------------------------------------------
-
-@cli.command()
-@click.argument("session_file")
-@click.option("--show-branches", is_flag=True, help="Show pending branch points.")
-@click.option("--show-paths", is_flag=True, help="Show completed paths.")
-@click.option("--resolve", type=str, default=None, help="Resolve a branch: node_id:candidate_index")
-def session(
-    session_file: str,
-    show_branches: bool,
-    show_paths: bool,
-    resolve: str | None,
-) -> None:
-    """Inspect or resume a trace session."""
-    _setup_logging(False)
-
-    from deeptrace.core.session import SessionManager
-
-    mgr = SessionManager(session_file)
-    sess = mgr.load()
-    if not sess:
-        console.print(f"[red]Could not load session from {session_file}[/red]")
-        sys.exit(1)
-
-    console.print(f"[bold]Session:[/bold] {sess.session_id}")
-    console.print(f"  Target: {sess.target}")
-    console.print(f"  Repo: {sess.repo_path}")
-    stats = mgr.summary()
-    for k, v in stats.items():
-        console.print(f"  {k}: {v}")
-
-    if show_branches:
-        from deeptrace.cli.interactive import display_branch_point
-        console.print(f"\n[bold yellow]Pending branches ({len(sess.pending_branches)}):[/bold yellow]")
-        for i, bp in enumerate(sess.pending_branches):
-            display_branch_point(bp, i)
-
-    if show_paths:
-        from deeptrace.cli.interactive import display_paths_summary
-        console.print(f"\n[bold]Completed paths ({len(sess.completed_paths)}):[/bold]")
-        display_paths_summary(sess.completed_paths[:20])
-
-    if resolve:
-        parts = resolve.rsplit(":", 1)
-        if len(parts) != 2:
-            console.print("[red]Format: node_id:candidate_index[/red]")
-            sys.exit(1)
-        node_id, idx_str = parts
-        bp = mgr.resolve_branch(node_id, int(idx_str))
-        if bp:
-            console.print(f"[green]Resolved branch at {node_id} → candidate #{idx_str}[/green]")
-        else:
-            console.print(f"[red]Branch not found: {node_id}[/red]")
-
-
-# ---------------------------------------------------------------------------
-# graph command (export for visualization)
-# ---------------------------------------------------------------------------
-
-@cli.command()
-@click.argument("traces_json")
-@click.option("--format", "fmt", type=click.Choice(["dot", "cytoscape", "d3"]), default="dot", help="Export format.")
-@click.option("--out", default=None, help="Output file (default: stdout).")
-def export_graph(traces_json: str, fmt: str, out: str | None) -> None:
-    """Export the dependency graph for visualization."""
-    _setup_logging(False)
-
-    import json
-    from pathlib import Path
-
-    data = json.loads(Path(traces_json).read_text())
-    nodes = data.get("nodes", [])
-    edges = data.get("edges", [])
-
-    if fmt == "dot":
-        lines = ["digraph deeptrace {", '  rankdir=BT;', '  node [shape=box, fontsize=10];']
-        for n in nodes:
-            label = n.get("name", n["id"])[:40]
-            loc = ""
-            if n.get("location"):
-                loc = f"\\n{n['location'].get('file', '')}:{n['location'].get('line', '')}"
-            lines.append(f'  "{n["id"]}" [label="{label}{loc}"];')
-        for e in edges:
-            label = e.get("kind", "")
-            lines.append(f'  "{e["src"]}" -> "{e["dst"]}" [label="{label}"];')
-        lines.append("}")
-        result = "\n".join(lines)
-
-    elif fmt == "cytoscape":
-        elements = []
-        for n in nodes:
-            elements.append({"data": {"id": n["id"], "label": n.get("name", "")}})
-        for e in edges:
-            elements.append({"data": {"source": e["src"], "target": e["dst"], "kind": e.get("kind", "")}})
-        result = json.dumps(elements, indent=2)
-
-    elif fmt == "d3":
-        d3_nodes = [{"id": n["id"], "name": n.get("name", "")} for n in nodes]
-        d3_links = [{"source": e["src"], "target": e["dst"], "kind": e.get("kind", "")} for e in edges]
-        result = json.dumps({"nodes": d3_nodes, "links": d3_links}, indent=2)
-    else:
-        result = ""
-
-    if out:
-        Path(out).write_text(result)
-        console.print(f"[green]Exported to {out}[/green]")
-    else:
-        print(result)
-
-
-# ---------------------------------------------------------------------------
-# visualize command (HTML timeline)
-# ---------------------------------------------------------------------------
-
-@cli.command()
-@click.argument("traces_json")
-@click.option("--repo", default=".", help="Path to source repo (for reading source files).")
-@click.option("--out", default=None, help="Output HTML file (default: traces_timeline.html).")
-@click.option("--max-paths", default=50, type=int, help="Max paths to include.")
-def visualize(traces_json: str, repo: str, out: str | None, max_paths: int) -> None:
-    """Generate an interactive HTML timeline visualization of trace paths."""
-    _setup_logging(False)
-
-    import json
-    from pathlib import Path
-
-    from deeptrace.models.graph import TraceOutput
-    from deeptrace.cli.visualize import generate_html
-
-    console.print(f"[bold]Loading traces from {traces_json}...[/bold]")
-
-    data = json.loads(Path(traces_json).read_text())
-    output = TraceOutput.model_validate(data)
-
-    if not output.paths:
-        console.print("[yellow]No paths found in the trace output.[/yellow]")
-        sys.exit(0)
-
-    if not out:
-        out = str(Path(traces_json).with_suffix('.html'))
-
-    html_path = generate_html(output, repo_path=repo, out_path=out, max_paths=max_paths)
-
-    console.print(f"\n[bold green]HTML visualization generated![/bold green]")
-    console.print(f"  Paths: {min(len(output.paths), max_paths)}")
-    console.print(f"  Output: [cyan]{html_path}[/cyan]")
-    console.print(f"\n  Open in browser: [bold]file://{os.path.abspath(html_path)}[/bold]\n")
-
-
-# ---------------------------------------------------------------------------
-# batch command
-# ---------------------------------------------------------------------------
-
-@cli.command()
-@click.option("--repo", required=True, help="Path to the source repository.")
-@click.option("--lines", "lines_file", required=True, help="Path to lines.json with targets.")
-@click.option("--out", default="batch_results", help="Output directory for results.")
-@click.option("--language", default=None, help="Override language detection.")
-@click.option("--max-depth", default=60, type=int, help="Max backward trace depth.")
-@click.option("--topk", default=40, type=int, help="Number of top paths per target.")
-@click.option("--llm/--no-llm", "llm_enabled", default=True, help="Enable LLM-based ranking.")
-@click.option("--llm-provider", type=click.Choice(["ollama", "anthropic", "openai"]), default="ollama", help="LLM provider.")
-@click.option("--llm-model", default="qwen3-coder:30b", help="LLM model name.")
-@click.option("--llm-base-url", default="", help="LLM API base URL.")
-@click.option("--llm-api-key", default="", help="API key (not needed for Ollama).")
-@click.option("--z3/--no-z3", "z3_enabled", default=True, help="Enable Z3 constraint checking.")
-@click.option("--cpg-save", default="", help="Save Joern CPG to this path for reuse.")
-@click.option("--cpg-load", default="", help="Load a pre-built CPG instead of generating.")
-@click.option("--joern-memory", default="12g", help="Docker container memory limit for Joern (default: 12g).")
-@click.option("--jvm-heap", default="8g", help="JVM max heap for joern-parse and queries (default: 8g). Must be less than --joern-memory.")
-@click.option("--max-files", default=5000, type=int, help="Max source files for tree-sitter.")
-@click.option("--max-caller-hops", default=3, type=int, help="Cross-file caller expansion depth (0=disabled).")
-@click.option("--no-treesitter", is_flag=True, default=False, help="Disable tree-sitter fallback.")
-@click.option("-v", "--verbose", is_flag=True, default=False, help="Enable debug logging.")
-def batch(
-    repo: str,
-    lines_file: str,
-    out: str,
-    language: str | None,
-    max_depth: int,
-    topk: int,
-    llm_enabled: bool,
-    llm_provider: str,
-    llm_model: str,
-    llm_base_url: str,
-    llm_api_key: str,
-    z3_enabled: bool,
-    cpg_save: str,
-    cpg_load: str,
-    joern_memory: str,
-    jvm_heap: str,
-    max_files: int,
-    max_caller_hops: int,
-    no_treesitter: bool,
-    verbose: bool,
-) -> None:
-    """Batch trace: process multiple targets from a lines.json file."""
-    _setup_logging(verbose)
-
-    from deeptrace.core.batch import BatchRunner, load_targets
-
-    # Load targets
-    try:
-        targets = load_targets(lines_file)
-    except Exception as exc:
-        console.print(f"[bold red]Error loading {lines_file}:[/bold red] {exc}")
-        sys.exit(1)
-
-    if not targets:
-        console.print("[yellow]No valid targets found in lines.json[/yellow]")
-        sys.exit(0)
-
-    console.print(f"\n[bold]deeptrace batch[/bold] — {len(targets)} targets from [cyan]{lines_file}[/cyan]\n")
-
-    # Build base config
-    config = DeeptraceConfig(
-        repo=repo,
-        target=f"{targets[0].file}:{targets[0].line}",  # initial target for language detection
-        out=out,
-        language=language,
-        max_depth=max_depth,
-        topk=topk,
-    )
-    config.treesitter.enabled = not no_treesitter
-    config.treesitter.max_files = max_files
-    config.max_caller_hops = max_caller_hops
-    config.llm.enabled = llm_enabled
-    if llm_provider:
-        from deeptrace.models.config import LLMProvider
-        config.llm.provider = LLMProvider(llm_provider)
-    config.llm.model = llm_model
-    if llm_base_url:
-        config.llm.base_url = llm_base_url
-    if llm_api_key:
-        config.llm.api_key = llm_api_key
-    config.z3.enabled = z3_enabled
-    if cpg_save:
-        config.joern.cpg_save_path = cpg_save
-    if cpg_load:
-        config.joern.cpg_load_path = cpg_load
-
-    config.joern.memory_limit = joern_memory
-    config.joern.jvm_heap = jvm_heap
-
-    # Run batch
-    runner = BatchRunner(config)
-
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TextColumn("{task.percentage:>3.0f}%"),
-        console=console,
-    ) as progress:
-        task = progress.add_task("Processing targets...", total=len(targets))
-
-        def on_batch_progress(idx: int, total: int, target_str: str) -> None:
-            progress.update(
-                task,
-                description=f"[{idx+1}/{total}] {target_str}",
-                completed=idx,
-            )
-
-        try:
-            batch_output = runner.run(targets, progress_callback=on_batch_progress)
-            progress.update(task, completed=len(targets))
-        except Exception as exc:
-            progress.stop()
-            console.print(f"\n[bold red]Error:[/bold red] {exc}")
-            if verbose:
-                import traceback
-                traceback.print_exc()
-            sys.exit(1)
-
-    # Write aggregated output
-    import os
-    os.makedirs(out, exist_ok=True)
-    agg_path = os.path.join(out, "batch_results.json")
-    runner.write_batch_output(batch_output, agg_path)
-
-    # Summary
-    console.print(f"\n[bold green]Batch complete![/bold green]")
-    console.print(f"  Targets: {batch_output.total_targets}")
-    console.print(f"  Successful: [green]{batch_output.successful}[/green]")
-    if batch_output.failed:
-        console.print(f"  Failed: [red]{batch_output.failed}[/red]")
-    console.print(f"  Output: {out}/")
-
-    # Show per-target summaries
-    total_paths = 0
-    total_sat = 0
-    for result in batch_output.results:
-        n_paths = len(result.paths)
-        n_sat = sum(1 for p in result.paths if p.is_satisfiable is True)
-        total_paths += n_paths
-        total_sat += n_sat
-        sat_str = f" [green]({n_sat} SAT)[/green]" if z3_enabled and n_sat else ""
-        console.print(f"    {result.target}: {n_paths} paths{sat_str}")
-
-    console.print(f"\n  Total paths: {total_paths}")
-    if z3_enabled:
-        console.print(f"  Total satisfiable: [green]{total_sat}[/green]")
-
-    for err in batch_output.errors:
-        console.print(f"    [red]FAILED[/red] {err['target']}: {err['error']}")
-
-    console.print()
-
-
-# ---------------------------------------------------------------------------
-# scan command
-# ---------------------------------------------------------------------------
-
-@cli.command()
-@click.option("--repo", required=True, help="Path to the source repository.")
-@click.option("--out", default="lines.json", help="Output lines.json file.")
-@click.option("--languages", default=None, help="Comma-separated language filter (c,cpp,java,python,etc). Default: all.")
-@click.option("--severity", type=click.Choice(["critical", "high", "medium", "low", "info"]), default="low", help="Minimum severity threshold.")
-@click.option("--context-lines", default=10, type=int, help="Lines of code context around each hit.")
-@click.option("--max-hits", default=500, type=int, help="Maximum total pattern hits to process.")
-@click.option("--max-source-hops", default=3, type=int, help="Caller chain depth for source discovery (0=skip source discovery).")
-@click.option("--include-sources", is_flag=True, default=False, help="Include source (input) locations in output.")
-@click.option("--llm/--no-llm", "llm_enabled", default=True, help="Enable LLM triage of pattern hits.")
-@click.option("--llm-provider", type=click.Choice(["ollama", "anthropic", "openai"]), default="ollama", help="LLM provider.")
-@click.option("--llm-model", default="qwen3-coder:30b", help="LLM model name.")
-@click.option("--llm-base-url", default="", help="LLM API base URL.")
-@click.option("--llm-api-key", default="", help="API key (not needed for Ollama).")
-@click.option("-v", "--verbose", is_flag=True, default=False, help="Enable debug logging.")
-def scan(
-    repo: str,
-    out: str,
-    languages: str | None,
-    severity: str,
-    context_lines: int,
-    max_hits: int,
-    max_source_hops: int,
-    include_sources: bool,
-    llm_enabled: bool,
-    llm_provider: str,
-    llm_model: str,
-    llm_base_url: str,
-    llm_api_key: str,
-    verbose: bool,
-) -> None:
-    """Scan a repository for potential vulnerability sinks and sources."""
-    _setup_logging(verbose)
-
-    from deeptrace.scanner.scanner import VulnScanner
-
-    # Parse language filter
-    lang_list = None
-    if languages:
-        lang_list = [l.strip() for l in languages.split(",")]
-
-    # Set up LLM caller
-    llm_caller = None
-    if llm_enabled:
-        from deeptrace.models.config import LLMConfig, LLMProvider
-        from deeptrace.analysis.llm_ranker import _call_llm
-
-        llm_config = LLMConfig(
-            enabled=True,
-            provider=LLMProvider(llm_provider),
-            model=llm_model,
-            max_tokens=4096,
-            temperature=0.2,
-        )
-        if llm_base_url:
-            llm_config.base_url = llm_base_url
-        if llm_api_key:
-            llm_config.api_key = llm_api_key
-
-        llm_caller = lambda system, user_msg: _call_llm(llm_config, system, user_msg)
-
-    console.print(f"\n[bold]deeptrace scan[/bold] — scanning [cyan]{repo}[/cyan]")
-    console.print(f"  Languages: {languages or 'all'}")
-    console.print(f"  Severity threshold: {severity}")
-    console.print(f"  Source discovery: {f'{max_source_hops} hops' if max_source_hops > 0 else 'disabled'}")
-    console.print(f"  LLM triage: {'enabled' if llm_enabled else 'disabled'}")
-    if llm_enabled:
-        console.print(f"  LLM: {llm_provider}/{llm_model}")
-    console.print()
-
-    scanner = VulnScanner(
-        repo_path=repo,
-        llm_caller=llm_caller,
-        languages=lang_list,
-        severity_threshold=severity,
-        context_lines=context_lines,
-        max_total_hits=max_hits,
-        max_source_hops=max_source_hops,
+_SCRIPT_IMPORT = r'''import io.shiftleft.semanticcpg.language._
+import io.joern.dataflowengineoss.language._
+import io.joern.dataflowengineoss.queryengine.EngineContext
+import scala.util.Try
+
+implicit val engineContext: EngineContext = EngineContext()
+
+val cpg = importCpg("__CPG_PATH__").get
+println("CPG_LOADED")
+'''
+
+_SCRIPT_FLOWS = r'''val targetFile = "__TARGET_FILE__"
+val targetLine = __TARGET_LINE__
+val maxFlows = __MAX_FLOWS__
+
+// Store IDs to iterate, preventing the loss of the Traversal context later
+val sinkIds = (cpg.call.lineNumber(targetLine).where(_.file.name(".*" + targetFile + "$")).id.l ++
+  cpg.identifier.lineNumber(targetLine).where(_.file.name(".*" + targetFile + "$")).id.l).distinct
+
+println("SINKS=" + sinkIds.size.toString)
+
+var flowCount = 0
+println("FLOWS_TSV_START")
+
+sinkIds.foreach { sId =>
+  if (flowCount < maxFlows) {
+    scala.util.Try {
+      val sinkT = cpg.call.id(sId) ++ cpg.identifier.id(sId)
+      // THE FIX: Broad enough to cross files, safe enough to prevent timeouts
+      val sources = cpg.methodParameterIn ++ cpg.call.nameNot("<operator>.*") ++ cpg.identifier
+      sinkT.reachableByFlows(sources)
+    }.toOption.foreach { paths =>
+      paths.foreach { flow =>
+        if (flowCount < maxFlows) {
+          println("FLOW_START")
+          flow.elements.foreach { elem =>
+            val nid = elem.id.toString
+            val lbl = elem.label
+            val f = scala.util.Try(elem.file.name.head).getOrElse("?")
+            val ln = elem.lineNumber.getOrElse(0).toString
+            val cl = elem.columnNumber.getOrElse(0).toString
+            val cd = elem.code.take(500).replace("\n", " ").replace("\r", " ").replace("\t", " ")
+            val nm = elem.code.take(60).replace("\n", " ").replace("\t", " ")
+            println("STEP\t" + nid + "\t" + lbl + "\t" + nm + "\t" + f + "\t" + ln + "\t" + cl + "\t" + cd)
+          }
+          println("FLOW_END")
+          flowCount = flowCount + 1
+        }
+      }
+    }
+  }
+}
+
+println("FLOWS_TSV_END")
+println("FLOWS=" + flowCount.toString)
+'''
+
+_SCRIPT_CALLGRAPH = r'''println("CALLGRAPH_TSV_START")
+cpg.call.take(__MAX_EDGES__).foreach { c =>
+  val callerId = c.id.toString  // USE THE EXACT CALL SITE ID, NOT THE METHOD NAME
+  val callee = c.methodFullName
+  val file = c.file.name.headOption.getOrElse("?")
+  val line = c.lineNumber.getOrElse(0).toString
+  val code = c.code.take(200).replace("\n", " ").replace("\r", " ").replace("\t", " ")
+  println("CALL\t" + callerId + "\t" + callee + "\t" + file + "\t" + line + "\t" + code)
+}
+println("CALLGRAPH_TSV_END")
+'''
+
+def _render_import(cpg_path: str) -> str:
+    return _SCRIPT_IMPORT.replace("__CPG_PATH__", cpg_path)
+
+
+def _render_flows(target_file: str, target_line: int, max_flows: int) -> str:
+    return (
+        _SCRIPT_FLOWS
+        .replace("__TARGET_FILE__", target_file)
+        .replace("__TARGET_LINE__", str(target_line))
+        .replace("__MAX_FLOWS__", str(max_flows))
     )
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TextColumn("{task.percentage:>3.0f}%"),
-        console=console,
-    ) as progress:
-        task = progress.add_task("Scanning...", total=100)
 
-        def on_progress(stage: str, pct: float) -> None:
-            labels = {
-                "scanning": "Phase A1: Scanning for vulnerability patterns...",
-                "context": "Phase A2: Extracting code context...",
-                "llm_triage": "Phase A3: LLM triaging candidates...",
-                "source_discovery": "Phase B1: Discovering sources from repo...",
-                "attack_vectors": "Phase B3: LLM analyzing attack vectors...",
-                "pairing": "Phase C: Connecting sinks with sources...",
-                "results": "Building results...",
-                "done": "Complete!",
-            }
-            progress.update(task, description=labels.get(stage, stage), completed=pct * 100)
-
-        try:
-            summary = scanner.scan(progress_callback=on_progress)
-        except Exception as exc:
-            progress.stop()
-            console.print(f"\n[bold red]Error:[/bold red] {exc}")
-            if verbose:
-                import traceback
-                traceback.print_exc()
-            sys.exit(1)
-
-    # Write output
-    scanner.write_output(summary, out, include_sources=include_sources)
-
-    # Display results
-    console.print(f"\n[bold green]Scan complete![/bold green]")
-    console.print(f"  Files scanned: {summary.files_scanned}")
-    console.print(f"  Pattern hits: {summary.pattern_hits}")
-    if summary.llm_evaluated:
-        console.print(f"  LLM evaluated: {summary.llm_evaluated}")
-        console.print(f"  False positives removed: [green]{summary.false_positives_removed}[/green]")
-    console.print(f"  [bold]Confirmed vulnerabilities: {summary.confirmed_vulns}[/bold]")
-    if summary.attack_vectors_analyzed:
-        console.print(f"  Attack vectors analyzed: {summary.attack_vectors_analyzed}")
-    console.print(f"  Sources identified: {summary.sources_found}")
-    if summary.pairs_identified:
-        console.print(f"  Source-sink pairs: {summary.pairs_identified}")
-    console.print(f"  Output: [cyan]{out}[/cyan]")
-    console.print(f"  Report: [cyan]{out}.report.md[/cyan]")
-
-    # Show top findings
-    sinks = [r for r in summary.results if r.hit_type != "source"]
-    if sinks:
-        console.print(f"\n  [bold]Top findings:[/bold]")
-        sev_icons = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "⚪"}
-        for r in sinks[:10]:
-            icon = sev_icons.get(r.severity, "⚪")
-            console.print(
-                f"    {icon} [{r.severity}] {r.category}: "
-                f"[cyan]{r.file}:{r.line}[/cyan] — {r.description}"
-            )
-
-    console.print()
+def _render_callgraph(max_edges: int) -> str:
+    return _SCRIPT_CALLGRAPH.replace("__MAX_EDGES__", str(max_edges))
 
 
 # ---------------------------------------------------------------------------
-# agent command (interactive exploit agent)
+# Docker execution
 # ---------------------------------------------------------------------------
 
-@cli.command()
-@click.argument("traces_json")
-@click.option("--repo", required=True, help="Path to the source repository.")
-@click.option("--out", default="agent_results", help="Output directory for results and logs.")
-@click.option("--path-index", default=0, type=int, help="Which trace path to exploit (default: 0 = top ranked).")
-@click.option("--max-turns", default=40, type=int, help="Maximum LLM turns before stopping.")
-@click.option("--docker-image", default="", help="Pre-built Docker image (skips image build). Must have /src/ with the repo and tools installed.")
-@click.option("--llm-provider", type=click.Choice(["ollama", "anthropic", "openai"]), default="ollama", help="LLM provider (used for exploration, or both if no coder specified).")
-@click.option("--llm-model", default="qwen3.5:35b", help="LLM model name.")
-@click.option("--llm-base-url", default="", help="LLM API base URL.")
-@click.option("--llm-api-key", default="", help="API key (not needed for Ollama).")
-@click.option("--coder-provider", type=click.Choice(["ollama", "anthropic", "openai"]), default="ollama", help="Coder LLM provider (optional — defaults to same as --llm-provider).")
-@click.option("--coder-model", default="gpt-oss:20b", help="Coder LLM model (optional — defaults to same as --llm-model).")
-@click.option("--coder-base-url", default="", help="Coder LLM API base URL (optional).")
-@click.option("--coder-api-key", default="", help="Coder API key (optional).")
-@click.option("-v", "--verbose", is_flag=True, default=False, help="Enable debug logging.")
-def agent(
-    traces_json: str,
-    repo: str,
-    out: str,
-    path_index: int,
-    max_turns: int,
-    docker_image: str,
-    llm_provider: str,
-    llm_model: str,
-    llm_base_url: str,
-    llm_api_key: str,
-    coder_provider: str,
-    coder_model: str,
-    coder_base_url: str,
-    coder_api_key: str,
-    verbose: bool,
-) -> None:
-    """Interactive exploit agent — LLM in a loop with shell + gdb inside Docker.
+class JoernBackend:
+    """Manages Joern via Docker for CPG generation and querying."""
 
-    Supports two modes:
+    def __init__(self, config: JoernConfig, repo_path: str) -> None:
+        self.config = config
+        self.repo_path = os.path.abspath(repo_path)
+        self._container_id: str | None = None
+        self._cpg_path: str = "/workspace/cpg.bin"
+        self._work_dir = tempfile.mkdtemp(prefix="deeptrace_joern_")
 
-    \b
-    SINGLE MODEL (default):
-      deeptrace agent traces.json --repo ./pdfium --llm-model qwen3-coder:30b
+    def _run_docker(self, cmd: list[str], timeout: int | None = None) -> str:
+        timeout = timeout or self.config.container_timeout
+        full_cmd = ["docker"] + cmd
+        logger.debug("Running: %s", " ".join(full_cmd))
+        result = subprocess.run(full_cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
+        if result.returncode != 0:
+            logger.debug("Docker stderr: %s", result.stderr[:2000])
+            logger.debug("Docker stdout (tail): %s", result.stdout[-2000:] if result.stdout else "<empty>")
+            raise RuntimeError(f"Docker command failed (rc={result.returncode}): {result.stderr[:500]}")
+        return result.stdout
 
-    \b
-    DUAL MODEL (explorer + coder):
-      deeptrace agent traces.json --repo ./pdfium \\
-        --llm-provider ollama --llm-model qwen3-coder:30b \\
-        --coder-provider anthropic --coder-model claude-sonnet-4-20250514
+    def _ensure_container(self) -> str:
+        if self._container_id:
+            return self._container_id
+        mount_flag = "ro" if self.config.mount_readonly else "rw"
+        jvm_heap = self.config.jvm_heap
+        cmd = [
+            "run", "-d", "--rm",
+            "--name", f"deeptrace-joern-{os.getpid()}",
+            "-v", f"{self.repo_path}:/repo:{mount_flag}",
+            "-v", f"{self._work_dir}:/workspace",
+            "-e", f"JAVA_OPTS=-Xmx{jvm_heap}",
+            "-e", f"_JAVA_OPTIONS=-Xmx{jvm_heap}",
+            f"--memory={self.config.memory_limit}",
+            f"--cpus={self.config.cpus}",
+            self.config.docker_image,
+            "tail", "-f", "/dev/null",
+        ]
+        self._container_id = self._run_docker(cmd).strip()[:12]
+        logger.info("Started Joern container: %s (JVM heap: %s, container: %s)",
+                     self._container_id, jvm_heap, self.config.memory_limit)
+        return self._container_id
 
-    In dual mode, the cheaper explorer model gathers repo information, then
-    the stronger coder model writes and iterates on the exploit harness.
-    If --coder-model is the same as --llm-model, single-model mode is used.
+    def _exec_in_container(self, cmd: str, timeout: int | None = None) -> str:
+        cid = self._ensure_container()
+        timeout = timeout or self.config.query_timeout
+        return self._run_docker(["exec", cid, "bash", "-c", cmd], timeout=timeout)
 
-    Requires Docker to be running.
-    """
-    _setup_logging(verbose)
-
-    import json as json_mod
-    from pathlib import Path
-
-    from deeptrace.models.graph import TraceOutput
-    from deeptrace.models.config import LLMConfig, LLMProvider
-    from deeptrace.analysis.llm_ranker import _call_llm
-    from deeptrace.exploit.repo_analyzer import analyze_repo
-    from deeptrace.exploit.docker_env import DockerEnv
-    from deeptrace.exploit.agent import ExploitAgent, AgentConfig
-
-    # Load traces
-    data = json_mod.loads(Path(traces_json).read_text(encoding="utf-8"))
-    trace_output = TraceOutput.model_validate(data)
-
-    if not trace_output.paths:
-        console.print("[yellow]No paths found in traces.json[/yellow]")
-        sys.exit(0)
-
-    if path_index >= len(trace_output.paths):
-        console.print(f"[red]Path index {path_index} out of range (0-{len(trace_output.paths)-1})[/red]")
-        sys.exit(1)
-
-    trace_path = trace_output.paths[path_index]
-
-    # Extract sink info from the trace
-    last_step = trace_path.steps[-1] if trace_path.steps else None
-    if not last_step:
-        console.print("[red]Trace path has no steps[/red]")
-        sys.exit(1)
-
-    sink_function = (last_step.node_name or "").split("|")[0].strip()
-    sink_file = last_step.location.file if last_step.location else ""
-
-    # Analyze repo
-    console.print(f"\n[bold]deeptrace agent[/bold] — interactive exploit agent")
-    console.print(f"  Repo: [cyan]{repo}[/cyan]")
-
-    profile = analyze_repo(repo)
-
-    console.print(f"  Detected: {profile.language} / {profile.build_system} / lib={profile.library_name}")
-    console.print(f"  Headers: {len(profile.key_headers)} | Fuzz harnesses: {len(profile.existing_fuzz_harnesses)}")
-    console.print(f"  Trace path: {path_index} (rank {trace_path.llm_rank})")
-    console.print(f"  Sink: [cyan]{sink_file}[/cyan] → {sink_function}")
-    console.print(f"  Tags: {', '.join(trace_path.vulnerability_tags or [])}")
-    console.print(f"  LLM: {llm_provider}/{llm_model}")
-
-    # Determine if dual-model mode
-    use_dual = bool(coder_model and (coder_model != llm_model or coder_provider != llm_provider))
-
-    if use_dual:
-        console.print(f"  Coder: {coder_provider or llm_provider}/{coder_model}")
-    console.print(f"  Max turns: {max_turns}")
-    console.print()
-
-    # Set up explorer LLM
-    llm_config = LLMConfig(
-        enabled=True,
-        provider=LLMProvider(llm_provider),
-        model=llm_model,
-        max_tokens=16384,
-        temperature=0.3,
-    )
-    if llm_base_url:
-        llm_config.base_url = llm_base_url
-    if llm_api_key:
-        llm_config.api_key = llm_api_key
-
-    llm_caller = lambda system, user_msg: _call_llm(llm_config, system, user_msg)
-
-    # Set up coder LLM (if different)
-    coder_caller = None
-    if use_dual:
-        coder_config = LLMConfig(
-            enabled=True,
-            provider=LLMProvider(coder_provider or llm_provider),
-            model=coder_model,
-            max_tokens=16384,
-            temperature=0.2,  # slightly lower temp for code
-        )
-        if coder_base_url:
-            coder_config.base_url = coder_base_url
-        elif llm_base_url:
-            coder_config.base_url = llm_base_url
-        if coder_api_key:
-            coder_config.api_key = coder_api_key
-        elif llm_api_key:
-            coder_config.api_key = llm_api_key
-
-        coder_caller = lambda system, user_msg: _call_llm(coder_config, system, user_msg)
-
-    # Build Docker environment
-    env = DockerEnv(profile)
-
-    try:
-        if docker_image:
-            console.print(f"[bold]Phase 1:[/bold] Using pre-built Docker image: {docker_image}")
-            env.use_prebuilt_image(docker_image)
-        else:
-            console.print("[bold]Phase 1:[/bold] Building Docker image (tools + source, no build)...")
-            console.print("  [dim]The agent will figure out how to build the library interactively.[/dim]")
-            env.build_image()
-
-        console.print("[bold]Phase 2:[/bold] Starting container...")
-        env.start_container()
-
-        console.print(f"[bold]Phase 3:[/bold] Running exploit agent (max {max_turns} turns)...")
-        console.print()
-
-        agent_config = AgentConfig(max_turns=max_turns)
-
-        exploit_agent = ExploitAgent(
-            llm_caller=llm_caller,
-            env=env,
-            profile=profile,
-            trace_path=trace_path,
-            sink_function=sink_function,
-            sink_file=sink_file,
-            config=agent_config,
-            progress_callback=lambda msg, turn: console.print(f"  [{turn+1}/{max_turns}] {msg}"),
-            llm_coder=coder_caller,
+    def _exec_joern_script(self, script: str, timeout: int | None = None) -> str:
+        script_path = "/workspace/query.sc"
+        local_script_path = os.path.join(self._work_dir, "query.sc")
+        with open(local_script_path, "w", encoding="utf-8") as f:
+            f.write(script)
+        logger.debug("Joern script written to %s (%d bytes)", local_script_path, len(script))
+        timeout = timeout or self.config.query_timeout
+        jvm_flag = f"-J-Xmx{self.config.jvm_heap}"
+        return self._exec_in_container(
+            f"cd /workspace && joern {jvm_flag} --script {script_path} 2>&1",
+            timeout=timeout,
         )
 
-        result = exploit_agent.run()
-
-        # Save results
-        os.makedirs(out, exist_ok=True)
-
-        # Save conversation log
-        log_path = os.path.join(out, "agent_log.json")
-        Path(log_path).write_text(
-            json_mod.dumps(result.log, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
-
-        # Save verification result
-        if result.verification:
-            vr_path = os.path.join(out, "verification.json")
-            Path(vr_path).write_text(json_mod.dumps({
-                "confirmed": result.verification.confirmed,
-                "sink_reached": result.verification.sink_reached,
-                "asan_crash": result.verification.asan_crash,
-                "asan_crash_type": result.verification.asan_crash_type,
-                "asan_location": result.verification.asan_location,
-                "asan_in_library": result.verification.asan_in_library,
-                "summary": result.verification.summary,
-            }, indent=2), encoding="utf-8")
-
-        # Copy harness out of container if successful
-        if result.harness_path:
+    def cleanup(self) -> None:
+        if self._container_id:
             try:
-                harness_content = env.read_file(result.harness_path, max_lines=5000)
-                Path(os.path.join(out, "harness.cpp")).write_text(
-                    harness_content, encoding="utf-8",
-                )
+                subprocess.run(["docker", "stop", self._container_id], capture_output=True, timeout=30)
             except Exception:
                 pass
+            self._container_id = None
 
-        # Display results
-        console.print()
-        console.print("=" * 60)
-        if result.success and result.verification:
-            console.print(f"[bold red]{result.verification.status_icon}[/bold red]")
-            console.print(f"[bold]{result.verification.summary}[/bold]")
-            console.print(f"  Turns used: {result.turns_used}")
-            console.print(f"  Time: {result.elapsed_seconds:.0f}s")
-            if result.verification.asan_trace:
-                console.print(f"\n  ASAN stack trace:")
-                for line in result.verification.asan_trace.split("\n")[:10]:
-                    console.print(f"    {line}")
-        elif result.verification and result.verification.sink_reached:
-            console.print(f"[yellow]{result.verification.status_icon}[/yellow]")
-            console.print("Sink reached but no crash — try with different LLM or more turns")
-        else:
-            console.print("[dim]⚪ Agent finished without triggering the vulnerability[/dim]")
-            console.print(f"  Turns used: {result.turns_used}/{max_turns}")
-            console.print(f"  Reason: {result.final_reason or 'budget exhausted'}")
+    # -----------------------------------------------------------------------
+    # CPG generation / save / load
+    # -----------------------------------------------------------------------
 
-        console.print(f"\n  Log: [cyan]{log_path}[/cyan]")
-        if result.success:
-            console.print(f"  Harness: [cyan]{os.path.join(out, 'harness.cpp')}[/cyan]")
-        console.print()
-
-    except Exception as exc:
-        console.print(f"\n[bold red]Error:[/bold red] {exc}")
-        if verbose:
-            import traceback
-            traceback.print_exc()
-        sys.exit(1)
-
-    finally:
-        console.print("Cleaning up Docker container...")
-        env.cleanup()
-
-
-# ---------------------------------------------------------------------------
-# validate command
-# ---------------------------------------------------------------------------
-
-@cli.command()
-@click.argument("traces_json")
-@click.option("--out", default="validation_reports", help="Output directory for reports.")
-@click.option("--llm-provider", type=click.Choice(["ollama", "anthropic", "openai"]), default="ollama", help="LLM provider.")
-@click.option("--llm-model", default="qwen3-coder:30b", help="LLM model name.")
-@click.option("--llm-base-url", default="", help="LLM API base URL.")
-@click.option("--llm-api-key", default="", help="API key (not needed for Ollama).")
-@click.option("--max-compile-retries", default=3, type=int, help="Max LLM repair attempts per harness.")
-@click.option("--max-input-rounds", default=3, type=int, help="Max rounds of input generation.")
-@click.option("--docker-image", default="gcc:13", help="Docker image for sandbox.")
-@click.option("--no-docker", is_flag=True, default=False, help="Use local gcc instead of Docker.")
-@click.option("-v", "--verbose", is_flag=True, default=False, help="Enable debug logging.")
-def validate(
-    traces_json: str,
-    out: str,
-    llm_provider: str,
-    llm_model: str,
-    llm_base_url: str,
-    llm_api_key: str,
-    max_compile_retries: int,
-    max_input_rounds: int,
-    docker_image: str,
-    no_docker: bool,
-    verbose: bool,
-) -> None:
-    """Validate trace paths: generate C harnesses, compile, run, and report."""
-    _setup_logging(verbose)
-
-    from deeptrace.exploit.validator import run_validation_pipeline
-    from deeptrace.models.config import LLMConfig, LLMProvider
-    from deeptrace.analysis.llm_ranker import _call_llm
-
-    # Build LLM config
-    llm_config = LLMConfig(
-        enabled=True,
-        provider=LLMProvider(llm_provider),
-        model=llm_model,
-        max_tokens=8192,   # harness code can be long
-        temperature=0.3,
-    )
-    if llm_base_url:
-        llm_config.base_url = llm_base_url
-    if llm_api_key:
-        llm_config.api_key = llm_api_key
-
-    # Create LLM caller
-    def llm_caller(system: str, user_msg: str) -> str:
-        return _call_llm(llm_config, system, user_msg)
-
-    console.print(f"\n[bold]deeptrace validate[/bold] — validating traces from [cyan]{traces_json}[/cyan]")
-    console.print(f"  LLM: {llm_provider}/{llm_model}")
-    console.print(f"  Sandbox: {'Docker (' + docker_image + ')' if not no_docker else 'local gcc'}")
-    console.print(f"  Output: {out}/\n")
-
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TextColumn("{task.percentage:>3.0f}%"),
-        console=console,
-    ) as progress:
-        task = progress.add_task("Validating...", total=100)
-
-        def on_progress(current: int, total: int, msg: str) -> None:
-            pct = (current / max(total, 1)) * 100
-            progress.update(task, description=msg, completed=pct)
-
-        try:
-            report_files = run_validation_pipeline(
-                traces_json_path=traces_json,
-                output_dir=out,
-                llm_caller=llm_caller,
-                max_compile_retries=max_compile_retries,
-                max_input_rounds=max_input_rounds,
-                use_docker=not no_docker,
-                docker_image=docker_image,
-                progress_callback=on_progress,
-            )
-            progress.update(task, description="Complete!", completed=100)
-        except Exception as exc:
-            progress.stop()
-            console.print(f"\n[bold red]Error:[/bold red] {exc}")
-            if verbose:
-                import traceback
-                traceback.print_exc()
-            sys.exit(1)
-
-    # Summary
-    console.print(f"\n[bold green]Validation complete![/bold green]")
-    console.print(f"  Reports: {len(report_files)} files in [cyan]{out}/[/cyan]")
-    for rf in report_files:
-        name = os.path.basename(rf)
-        console.print(f"    {name}")
-    console.print()
-
-# ======================================================================
-# REASON command — deep vulnerability analysis of traces
-# ======================================================================
-
-@cli.command()
-@click.argument("traces_json")
-@click.option("--repo", required=True, help="Path to the source repository (needed to read source code).")
-@click.option("--out", default="", help="Output file for the report (default: <traces>_reasoning.md).")
-@click.option("--top-n", default=10, type=int, help="Analyze the top N paths by score (default: 10).")
-@click.option("--llm-provider", type=click.Choice(["ollama", "anthropic", "openai"]), default="ollama", help="LLM provider.")
-@click.option("--llm-model", default="qwen3-coder:30b", help="LLM model name.")
-@click.option("--llm-base-url", default="", help="LLM API base URL (for LiteLLM proxy, vLLM, etc.).")
-@click.option("--llm-api-key", default="", help="API key.")
-@click.option("--json-out", default="", help="Also write structured JSON output to this file.")
-@click.option("-v", "--verbose", is_flag=True, default=False, help="Enable debug logging.")
-def reason(
-    traces_json: str,
-    repo: str,
-    out: str,
-    top_n: int,
-    llm_provider: str,
-    llm_model: str,
-    llm_base_url: str,
-    llm_api_key: str,
-    json_out: str,
-    verbose: bool,
-) -> None:
-    """Deep vulnerability reasoning — analyze traces like a security researcher.
-
-    \b
-    Takes the trace output (traces.json) and has the LLM reason step-by-step
-    through each path, reading actual source code, checking for guards and
-    mitigations, and determining if the vulnerability is real.
-
-    \b
-    Each path gets a verdict:
-      🔴 VULNERABLE    — real bug with clear root cause
-      🟡 LIKELY        — probably a bug, needs confirmation
-      ⚪ UNLIKELY      — probably safe, but edge cases possible
-      ⚫ FALSE_POSITIVE — not a real bug (guard exists, safe pattern, etc.)
-
-    \b
-    Output: Markdown report with reasoning + optional JSON.
-
-    \b
-    Examples:
-      deeptrace reason traces.json --repo ./pdfium
-      deeptrace reason traces.json --repo ./pdfium --top-n 5 --llm-provider anthropic --llm-model claude-sonnet-4-20250514
-      deeptrace reason traces.json --repo ./libxml2 --llm-base-url http://my-proxy:4000 --json-out results.json
-    """
-    _setup_logging(verbose)
-
-    import json as json_mod
-    from pathlib import Path
-
-    from deeptrace.models.graph import TraceOutput
-    from deeptrace.models.config import LLMConfig, LLMProvider
-    from deeptrace.analysis.llm_ranker import _call_llm
-    from deeptrace.analysis.vulnerability_reasoner import (
-        VulnerabilityReasoner,
-        format_assessment_report,
-        assessments_to_json,
-    )
-
-    # Load traces
-    data = json_mod.loads(Path(traces_json).read_text(encoding="utf-8"))
-    trace_output = TraceOutput.model_validate(data)
-
-    if not trace_output.paths:
-        console.print("[yellow]No paths found in traces.json[/yellow]")
-        sys.exit(0)
-
-    console.print(f"\n[bold]deeptrace reason[/bold] — vulnerability reasoning")
-    console.print(f"  Repo: [cyan]{repo}[/cyan]")
-    console.print(f"  Target: [cyan]{trace_output.target}[/cyan]")
-    console.print(f"  Paths: {len(trace_output.paths)} total, analyzing top {min(top_n, len(trace_output.paths))}")
-    console.print(f"  LLM: {llm_provider}/{llm_model}")
-    console.print()
-
-    # Set up LLM
-    llm_config = LLMConfig(
-        enabled=True,
-        provider=LLMProvider(llm_provider),
-        model=llm_model,
-        max_tokens=4096,
-        temperature=0.2,
-    )
-    if llm_base_url:
-        llm_config.base_url = llm_base_url
-    if llm_api_key:
-        llm_config.api_key = llm_api_key
-
-    llm_caller = lambda system, user_msg: _call_llm(llm_config, system, user_msg)
-
-    # Create reasoner
-    reasoner = VulnerabilityReasoner(
-        llm_caller=llm_caller,
-        repo_path=repo,
-    )
-
-    # Analyze paths
-    console.print("[bold]Analyzing traces...[/bold]")
-    assessments = reasoner.analyze_all(
-        trace_output.paths,
-        top_n=top_n,
-        progress_callback=lambda cur, total: console.print(
-            f"  [{cur}/{total}] Analyzing path...", end="\r"
-        ),
-    )
-    console.print()
-
-    # Print summary to console
-    for i, a in enumerate(assessments):
-        icon = {
-            "EXPLOITABLE": "[bold red]🔴 EXPLOITABLE[/bold red]",
-            "NOT_EXPLOITABLE": "[dim green]✅ NOT EXPLOITABLE[/dim green]",
-            "NEEDS_REVIEW": "[yellow]❓ NEEDS REVIEW[/yellow]",
-        }.get(a.verdict, f"❓ {a.verdict}")
-
-        console.print(f"  Path {i + 1} ({a.path_id}): {icon}  ({a.confidence:.0%})")
-        if a.vulnerability_class:
-            console.print(f"    Class: {a.vulnerability_class}")
-        if a.root_cause:
-            console.print(f"    Root cause: {a.root_cause[:150]}")
-        if a.why_not:
-            console.print(f"    Why safe: {a.why_not[:150]}")
-        if a.cwe:
-            console.print(f"    {a.cwe}")
-        console.print()
-
-    # Write Markdown report
-    if not out:
-        base = Path(traces_json).stem
-        out = f"{base}_reasoning.md"
-
-    report = format_assessment_report(
-        assessments,
-        target=trace_output.target,
-        repo=repo,
-    )
-    Path(out).write_text(report, encoding="utf-8")
-    console.print(f"[bold green]Report written to:[/bold green] [cyan]{out}[/cyan]")
-
-    # Write JSON if requested
-    if json_out:
-        json_data = assessments_to_json(assessments)
-        Path(json_out).write_text(
-            json_mod.dumps(json_data, indent=2, ensure_ascii=False),
-            encoding="utf-8",
+    def generate_cpg(self, language: Language | None = None) -> None:
+        cid = self._ensure_container()
+        if self.config.cpg_load_path:
+            self.load_cpg(self.config.cpg_load_path)
+            return
+        lang_flag = ""
+        if language and language in _JOERN_LANG:
+            lang_flag = f"--language {_JOERN_LANG[language]}"
+        extra = " ".join(self.config.extra_joern_opts)
+        jvm_flag = f"-J-Xmx{self.config.jvm_heap}"
+        logger.info("Generating CPG for %s (lang=%s, heap=%s)...",
+                     self.repo_path, language, self.config.jvm_heap)
+        t0 = time.time()
+        self._exec_in_container(
+            f"joern-parse {jvm_flag} /repo -o {self._cpg_path} {lang_flag} {extra}",
+            timeout=self.config.cpg_timeout,
         )
-        console.print(f"[bold green]JSON written to:[/bold green] [cyan]{json_out}[/cyan]")
+        # Log CPG size to help diagnose truncation
+        size_output = self._exec_in_container(f"ls -lh {self._cpg_path} | awk '{{print $5}}'", timeout=10)
+        logger.info("CPG generated in %.1fs (size: %s)", time.time() - t0, size_output.strip())
+        if self.config.cpg_save_path:
+            self.save_cpg(self.config.cpg_save_path)
 
-    # Final summary
-    exploit_count = sum(1 for a in assessments if a.verdict == "EXPLOITABLE")
-    safe_count = sum(1 for a in assessments if a.verdict == "NOT_EXPLOITABLE")
-    if exploit_count:
-        console.print(f"\n[bold red]🔴 {exploit_count} exploitable vulnerabilities found.[/bold red]")
-    elif safe_count == len(assessments):
-        console.print(f"\n[bold green]✅ All {safe_count} paths are not exploitable.[/bold green]")
-    else:
-        console.print(f"\n[yellow]❓ {len(assessments) - safe_count} paths need manual review.[/yellow]")
-    console.print()
+    def save_cpg(self, host_path: str) -> None:
+        if not self._container_id:
+            raise RuntimeError("No active Joern container")
+        host_path = os.path.abspath(host_path)
+        os.makedirs(os.path.dirname(host_path) or ".", exist_ok=True)
+        logger.info("Saving CPG to %s ...", host_path)
+        t0 = time.time()
+        subprocess.run(["docker", "cp", f"{self._container_id}:{self._cpg_path}", host_path], check=True, capture_output=True, timeout=120)
+        size_mb = os.path.getsize(host_path) / (1024 * 1024)
+        logger.info("CPG saved: %s (%.1f MB) in %.1fs", host_path, size_mb, time.time() - t0)
+
+    def load_cpg(self, host_path: str) -> None:
+        if not self._container_id:
+            raise RuntimeError("No active Joern container")
+        host_path = os.path.abspath(host_path)
+        if not os.path.exists(host_path):
+            raise FileNotFoundError(f"CPG file not found: {host_path}")
+        size_mb = os.path.getsize(host_path) / (1024 * 1024)
+        logger.info("Loading pre-built CPG from %s (%.1f MB)...", host_path, size_mb)
+        t0 = time.time()
+        subprocess.run(["docker", "cp", host_path, f"{self._container_id}:{self._cpg_path}"], check=True, capture_output=True, timeout=120)
+        logger.info("CPG loaded in %.1fs (skipped joern-parse)", time.time() - t0)
+
+    # -----------------------------------------------------------------------
+    # Flow extraction
+    # -----------------------------------------------------------------------
+
+    def extract_backward_flows(self, target_file: str, target_line: int, max_flows: int = 400) -> list[list[dict[str, Any]]]:
+        logger.info("Extracting backward flows to %s:%d (max=%d)", target_file, target_line, max_flows)
+        script = _render_import(self._cpg_path)
+        script += _render_flows(target_file, target_line, max_flows)
+        output = self._exec_joern_script(script, timeout=self.config.query_timeout)
+        return self._parse_tsv_flows(output)
+
+    def extract_call_graph(self, max_edges: int = 2000) -> list[dict[str, Any]]:
+        script = _render_import(self._cpg_path)
+        script += _render_callgraph(max_edges)
+        output = self._exec_joern_script(script, timeout=self.config.query_timeout)
+        return self._parse_tsv_calls(output)
+
+    def extract_pdg_edges(self, target_file: str, max_edges: int = 2000) -> list[dict[str, Any]]:
+        return []  # PDG extraction disabled
+
+    # -----------------------------------------------------------------------
+    # TSV parsing
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_tsv_flows(output: str) -> list[list[dict[str, Any]]]:
+        flows: list[list[dict[str, Any]]] = []
+        current: list[dict[str, Any]] = []
+        active = False
+        for line in output.split("\n"):
+            s = line.strip()
+            if s == "FLOWS_TSV_START":
+                active = True
+            elif s == "FLOWS_TSV_END":
+                break
+            elif not active:
+                continue
+            elif s == "FLOW_START":
+                current = []
+            elif s == "FLOW_END":
+                if current:
+                    flows.append(current)
+            elif s.startswith("STEP\t"):
+                parts = s.split("\t", 7)
+                if len(parts) >= 7:
+                    current.append({
+                        "id": parts[1], "label": parts[2], "name": parts[3],
+                        "file": parts[4],
+                        "line": int(parts[5]) if parts[5].lstrip("-").isdigit() else 0,
+                        "col": int(parts[6]) if parts[6].lstrip("-").isdigit() else 0,
+                        "code": parts[7] if len(parts) > 7 else "",
+                    })
+        logger.info("Parsed %d flows from Joern TSV", len(flows))
+        return flows
+
+    @staticmethod
+    def _parse_tsv_calls(output: str) -> list[dict[str, Any]]:
+        edges: list[dict[str, Any]] = []
+        active = False
+        for line in output.split("\n"):
+            s = line.strip()
+            if s == "CALLGRAPH_TSV_START":
+                active = True
+            elif s == "CALLGRAPH_TSV_END":
+                break
+            elif not active:
+                continue
+            elif s.startswith("CALL\t"):
+                parts = s.split("\t", 5)
+                if len(parts) >= 5:
+                    edges.append({
+                        "caller": parts[1], "callee": parts[2], "file": parts[3],
+                        "line": int(parts[4]) if parts[4].lstrip("-").isdigit() else 0,
+                        "code": parts[5] if len(parts) > 5 else "",
+                    })
+        logger.info("Parsed %d call edges from Joern TSV", len(edges))
+        return edges
 
 
-if __name__ == "__main__":
-    cli()
+# ---------------------------------------------------------------------------
+# Flow → Graph conversion
+# ---------------------------------------------------------------------------
+
+def flows_to_graph(
+    flows: list[list[dict[str, Any]]],
+    call_edges: list[dict[str, Any]] | None = None,
+) -> tuple[list[GraphNode], list[GraphEdge]]:
+    nodes_map: dict[str, GraphNode] = {}
+    edges_set: set[str] = set()
+    edges: list[GraphEdge] = []
+
+    def _node_id(item: dict[str, Any]) -> str:
+        return f"j:{item.get('file', '?')}:{item.get('line', 0)}:{item.get('name', item.get('id', '?'))}"
+
+    def _classify_node(label: str) -> NodeKind:
+        ll = label.lower()
+        if "call" in ll: return NodeKind.CALL_SITE
+        if "identifier" in ll: return NodeKind.IDENTIFIER
+        if "param" in ll: return NodeKind.PARAM
+        if "return" in ll: return NodeKind.RETURN_VAL
+        if "literal" in ll: return NodeKind.LITERAL
+        if "field" in ll: return NodeKind.FIELD
+        return NodeKind.UNKNOWN
+
+    def _classify_edge(src_label: str, dst_label: str) -> EdgeKind:
+        if "param" in dst_label.lower(): return EdgeKind.PARAM_PASS
+        if "return" in src_label.lower(): return EdgeKind.RETURN
+        if "call" in src_label.lower() or "call" in dst_label.lower(): return EdgeKind.CALL
+        if "field" in src_label.lower() or "field" in dst_label.lower(): return EdgeKind.FIELD_ACCESS
+        return EdgeKind.DATA_FLOW
+
+    for flow in flows:
+        prev_id: str | None = None
+        current_method: str = ""
+        for step in flow:
+            nid = _node_id(step)
+            # Track enclosing method scope from Joern labels.
+            # IMPORTANT: Only METHOD / METHOD_RETURN labels carry the real
+            # function name.  METHOD_PARAMETER_IN nodes carry the *parameter
+            # declaration* (e.g. "const WideString& str") which must NOT be
+            # used as the scope — that would make the frontier expander search
+            # for call sites of "const WideString& str" instead of "CheckMailLink".
+            label = step.get("label", "").upper()
+            step_name = step.get("name", "")
+            if step_name and ("METHOD" in label and "PARAM" not in label):
+                current_method = step_name
+
+            if nid not in nodes_map:
+                nodes_map[nid] = GraphNode(
+                    id=nid, kind=_classify_node(step.get("label", "")),
+                    name=step_name,
+                    location=SourceLocation(
+                        file=step.get("file", ""), line=step.get("line", 0),
+                        column=step.get("col", 0), code_snippet=step.get("code", ""),
+                    ),
+                    backend=BackendKind.JOERN,
+                    properties={"scope": current_method},
+                )
+            if prev_id and prev_id != nid:
+                eid = f"{prev_id}->{nid}"
+                if eid not in edges_set:
+                    edges_set.add(eid)
+                    prev_label = nodes_map[prev_id].kind.value if prev_id in nodes_map else ""
+                    edges.append(GraphEdge(src=prev_id, dst=nid, kind=_classify_edge(prev_label, step.get("label", "")), backend=BackendKind.JOERN))
+            prev_id = nid
+
+    if call_edges:
+        for ce in call_edges:
+            # Build caller ID consistently with flow nodes (file:line:code-based)
+            caller_file = ce.get("file", "?")
+            caller_line = ce.get("line", 0)
+            caller_code = ce.get("code", "")[:60].replace("\t", " ").replace("\n", " ")
+            caller_id = f"j:{caller_file}:{caller_line}:call:{caller_code}"
+
+            # Extract short function name from fully-qualified callee name
+            callee_full = ce.get("callee", "")
+            callee_short = callee_full.rsplit(".", 1)[-1] if callee_full else ""
+            callee_id = f"j:method:{callee_full}"
+
+            if caller_id not in nodes_map:
+                nodes_map[caller_id] = GraphNode(id=caller_id, kind=NodeKind.CALL_SITE, name=callee_short,
+                    location=SourceLocation(file=caller_file, line=caller_line, code_snippet=ce.get("code", "")),
+                    backend=BackendKind.JOERN,
+                    properties={"scope": ""})
+
+            # Callee stubs represent the function definition target, not a call site
+            if callee_id not in nodes_map:
+                nodes_map[callee_id] = GraphNode(id=callee_id, kind=NodeKind.IDENTIFIER, name=callee_short,
+                    backend=BackendKind.JOERN,
+                    properties={"scope": callee_short})
+
+            eid = f"{caller_id}->{callee_id}"
+            if eid not in edges_set:
+                edges_set.add(eid)
+                edges.append(GraphEdge(src=caller_id, dst=callee_id, kind=EdgeKind.CALL, backend=BackendKind.JOERN))
+
+    return list(nodes_map.values()), edges
