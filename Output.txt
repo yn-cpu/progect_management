@@ -1,1 +1,2457 @@
 
+"""Interactive exploit agent: LLM in a loop with shell access.
+
+The agent operates inside a Docker container with the target compiled with
+ASAN.  It has access to gdb, cscope, grep, and can compile and run code.
+It iterates — writing code, compiling, observing failures, adjusting —
+until the exploit is verified or the budget is exhausted.
+
+Architecture:
+  1. System prompt sets the role and rules.
+  2. Initial context provides: repo profile, vulnerability trace, source code
+     near the sink, existing test/fuzz harnesses.
+  3. Each turn: LLM emits actions in XML tags, we execute them in Docker,
+     feed the results back.
+  4. Verification: GDB breakpoint on the real sink function — the LLM
+     can't fake this.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+import time
+from dataclasses import dataclass, field
+from typing import Any, Callable
+
+from deeptrace.exploit.docker_env import DockerEnv, ExecResult
+from deeptrace.exploit.repo_analyzer import RepoProfile
+from deeptrace.exploit.verification import verify_harness, VerificationResult
+from deeptrace.models.graph import TracePath
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# System prompt
+# ---------------------------------------------------------------------------
+
+_ACTION_FORMAT_BLOCK = """
+=== TOOLS ===
+
+You interact with the environment ONLY through these tools:
+
+<shell>command</shell>
+  Run a shell command in the Docker container. You see stdout+stderr.
+
+<write_file path="/work/file.cpp">
+file content here
+</write_file>
+  Write a file inside the container.
+
+<read_file path="/src/file.c" />
+  Read a file from the container.
+
+<submit path="/work/harness" input="/work/input.pdf">
+  Explanation of what this exploit does and why it triggers the vulnerability.
+</submit>
+  Submit your exploit for verification. Only submit when you have:
+  1. A compiled binary that runs
+  2. An input file that triggers a crash or ASAN error
+  The system will run your binary with the input and check for ASAN output.
+
+<done reason="explanation" />
+  Signal that you're finished exploring (dual-model mode) or giving up.
+
+=== RULES ===
+- Every response MUST contain at least one tool tag
+- Do NOT write prose explanations without tool tags — I cannot execute prose
+- When something crashes, investigate with gdb — do NOT guess
+- Form a hypothesis, test it, and adjust based on evidence
+- If compilation fails, read the error carefully and fix the specific issue
+
+=== EXAMPLE TURN ===
+
+<shell>ls /src/ | head -20</shell>
+<shell>find /src -name "README*" -o -name "BUILD*" | head -10</shell>
+"""
+
+_EXPLORER_PROMPT = f"""You are a security researcher exploring a C/C++ repository inside a Docker container.
+The target library source is at /src/. Your workspace is /work/.
+{_ACTION_FORMAT_BLOCK}
+
+YOUR TASK: Explore the repository and gather ALL information needed to write an exploit harness.
+
+You need to find:
+1. BUILD SYSTEM: How does this project compile? (CMake, Make, gn, Cargo, etc.)
+   - Can you build it with the tools available? (g++, cmake, make are installed)
+   - If not, which source files would need to be compiled directly?
+
+2. PUBLIC API: Where are the public headers?
+   - What functions are exposed? What are their signatures?
+   - How do you initialize/cleanup the library?
+
+3. EXISTING TESTS: Are there fuzz harnesses or test programs?
+   - How do they call the library? What input format do they use?
+   - What #includes and link flags do they use?
+
+4. VULNERABILITY CONTEXT: The trace shows a path to the sink.
+   - What functions are in the trace? How are they connected?
+   - What input triggers this code path?
+
+5. TEST DATA: Are there sample input files (PDFs, images, etc.)?
+
+Be EFFICIENT. Don't repeat commands. Don't read entire files — use head/grep/sed.
+After 3-5 turns of exploration, summarize what you've found with:
+<done reason="EXPLORATION COMPLETE: [summary of findings]" />"""
+
+_CODER_PROMPT = f"""You are an exploit developer with shell access to a Docker container.
+The target library source is at /src/. Your workspace is /work/.
+{_ACTION_FORMAT_BLOCK}
+
+YOUR OBJECTIVE: Write a C/C++ harness that triggers a crash INSIDE the real library code.
+
+You will receive an exploration summary from a prior analysis phase. Use it.
+
+APPROACH:
+1. Write /work/harness.cpp that calls REAL library functions via REAL headers
+   - NO stubs, NO mocks, NO fake implementations
+   - Read input from argv[1] (file on disk)
+   - Use the existing fuzz harnesses/tests as reference
+
+2. Compile it:
+   - Try: g++ -fsanitize=address -g -std=c++17 -I/src -I/src/public harness.cpp ...
+   - If linking fails, compile individual source files and link them
+   - Check compilation errors and fix them — don't repeat the same broken command
+
+3. Run it with a test input:
+   - Find seed files in /src/testing/resources/ or create minimal ones
+   - Check ASAN output: crash must be in LIBRARY code, not your harness
+
+4. Iterate:
+   - Compilation error → fix include paths or missing files
+   - Crash in harness → fix your code
+   - Crash in library → SUCCESS
+
+Start your FIRST response by writing the harness based on the exploration summary."""
+
+# Combined prompt for single-model mode (backward compatible)
+_SYSTEM_PROMPT = f"""You are an exploit developer with shell access to a Docker container.
+The target library source is at /src/. Your workspace is /work/.
+{_ACTION_FORMAT_BLOCK}
+
+YOUR OBJECTIVE: Trigger a crash INSIDE the real library code (not in your harness).
+
+PHASE 1 — EXPLORE AND BUILD:
+  - Start by exploring /src/ (ls, find, cat README, etc.)
+  - Find how the project builds (CMake? Make? gn? Cargo?)
+  - Build with ASAN flags or find pre-built ASAN binaries
+  - If full build is too complex, compile just the trace-relevant source files
+
+PHASE 2 — WRITE HARNESS:
+  - Find public headers and existing test/fuzz harnesses in the repo
+  - Write /work/harness.cpp that calls REAL library functions
+  - NO stubs, NO mocks, NO fake implementations
+  - Read input from argv[1] (file on disk)
+
+PHASE 3 — TEST AND ITERATE:
+  - Compile harness against the ASAN library
+  - Find seed input files in /src/testing/ or /src/test/
+  - Run and check ASAN output
+  - If crash is in YOUR code → fix your harness
+  - If crash is in LIBRARY code → SUCCESS
+
+- Do NOT create stub/mock functions
+- Start your FIRST response with: <shell>ls /src/ | head -30</shell>"""
+
+# ---------------------------------------------------------------------------
+# Action parsing
+# ---------------------------------------------------------------------------
+
+@dataclass
+class AgentAction:
+    """One parsed action from the LLM's response."""
+    kind: str          # "shell", "write_file", "read_file", "done", "submit"
+    content: str = ""  # command text, file content, or reason
+    path: str = ""     # file path (for write_file/read_file/submit)
+
+
+def parse_actions(response: str) -> list[AgentAction]:
+    """Parse actions from the LLM's response.
+
+    Supports both XML tags (preferred) and markdown code blocks (fallback).
+    Many LLMs default to markdown even when asked for XML, so we handle both.
+    """
+    actions: list[AgentAction] = []
+
+    # === Priority 1: XML tags (the format we asked for) ===
+
+    # <shell>command</shell>
+    for m in re.finditer(r"<shell>(.*?)</shell>", response, re.DOTALL):
+        cmd = m.group(1).strip()
+        if cmd:
+            actions.append(AgentAction(kind="shell", content=cmd))
+
+    # <write_file path="...">content</write_file>
+    for m in re.finditer(
+        r'<write_file\s+path="([^"]+)">(.*?)</write_file>', response, re.DOTALL
+    ):
+        actions.append(AgentAction(kind="write_file", path=m.group(1), content=m.group(2)))
+
+    # <read_file path="..." />
+    for m in re.finditer(r'<read_file\s+path="([^"]+)"\s*/>', response):
+        actions.append(AgentAction(kind="read_file", path=m.group(1)))
+
+    # <done reason="..." /> or <done>reason</done>
+    for m in re.finditer(r'<done\s+reason="([^"]*)"', response):
+        actions.append(AgentAction(kind="done", content=m.group(1)))
+    for m in re.finditer(r"<done>(.*?)</done>", response, re.DOTALL):
+        if not any(a.kind == "done" for a in actions):
+            actions.append(AgentAction(kind="done", content=m.group(1).strip()))
+
+    # <submit path="/work/harness.cpp" input="/work/input.pdf">reason</submit>
+    for m in re.finditer(
+        r'<submit\s+path="([^"]+)"(?:\s+input="([^"]*)")?\s*>(.*?)</submit>',
+        response, re.DOTALL,
+    ):
+        actions.append(AgentAction(
+            kind="submit",
+            path=m.group(1),
+            content=f"input={m.group(2) or '/work/input.pdf'}|{m.group(3).strip()}",
+        ))
+
+    # If XML parsing found actions, return them
+    if actions:
+        return actions
+
+    # === Priority 2: Markdown code blocks (common LLM fallback) ===
+
+    # ```bash ... ``` → shell action
+    for m in re.finditer(r"```(?:bash|sh|shell)\s*\n([\s\S]*?)\n\s*```", response):
+        block = m.group(1).strip()
+        if not block:
+            continue
+        # Split multi-line shell blocks into individual commands
+        # but keep multi-line commands (ending with \) together
+        lines = block.split("\n")
+        cmd_buffer = ""
+        for line in lines:
+            stripped = line.strip()
+            # Skip comments and empty lines
+            if not stripped or stripped.startswith("#"):
+                continue
+            cmd_buffer += (" " if cmd_buffer else "") + stripped
+            if not stripped.endswith("\\"):
+                actions.append(AgentAction(kind="shell", content=cmd_buffer))
+                cmd_buffer = ""
+        if cmd_buffer:
+            actions.append(AgentAction(kind="shell", content=cmd_buffer))
+
+    # ```cpp ... ``` or ```c ... ``` → write_file if it looks like a complete file
+    for m in re.finditer(r"```(?:cpp|c\+\+|c)\s*\n([\s\S]*?)\n\s*```", response):
+        code = m.group(1).strip()
+        if "#include" in code and ("int main" in code or "LLVMFuzzerTestOneInput" in code):
+            # Looks like a complete harness file
+            # Try to find a filename hint nearby
+            before = response[max(0, m.start() - 200):m.start()]
+            fname_match = re.search(r'(/work/\S+\.(?:cpp|c|cc))', before)
+            path = fname_match.group(1) if fname_match else "/work/harness.cpp"
+            actions.append(AgentAction(kind="write_file", path=path, content=code))
+
+    # === Priority 3: Bare shell commands (lines starting with $ or common commands) ===
+    if not actions:
+        for line in response.split("\n"):
+            stripped = line.strip()
+            # Lines starting with $ (shell prompt)
+            if stripped.startswith("$ "):
+                cmd = stripped[2:].strip()
+                if cmd:
+                    actions.append(AgentAction(kind="shell", content=cmd))
+            # Common exploration commands without $ prefix
+            elif re.match(r'^(ls |cat |grep |find |head |tail |cd |pwd|echo |mkdir |cp |make |g\+\+|gcc |clang|ninja |cmake )', stripped):
+                actions.append(AgentAction(kind="shell", content=stripped))
+
+    return actions
+
+
+# ---------------------------------------------------------------------------
+# Agent
+# ---------------------------------------------------------------------------
+
+@dataclass
+class AgentConfig:
+    """Configuration for the exploit agent."""
+    max_turns: int = 40             # maximum LLM turns
+    max_actions_per_turn: int = 10  # cap actions parsed per turn
+    exec_timeout: int = 60          # per-command timeout
+    verify_timeout: int = 30        # verification run timeout
+    context_window: int = 12        # keep last N exchanges in context
+
+
+@dataclass
+class AgentResult:
+    """Final result of the agent run."""
+    success: bool = False
+    verification: VerificationResult | None = None
+    turns_used: int = 0
+    total_actions: int = 0
+    elapsed_seconds: float = 0.0
+    harness_path: str = ""
+    input_path: str = ""
+    final_reason: str = ""
+    postmortem: dict[str, Any] = field(default_factory=dict)  # failure analysis
+    log: list[dict[str, Any]] = field(default_factory=list)  # structured turn logs
+
+
+class ExploitAgent:
+    """Interactive exploit agent that drives an LLM in a tool-use loop.
+
+    Supports two operating modes:
+
+    **Single-model** (default): One LLM handles both exploration and coding.
+    Uses ``_SYSTEM_PROMPT`` for all turns.
+
+    **Dual-model**: A cheaper/faster explorer model gathers information,
+    then a stronger coder model writes and iterates on the harness.
+    Pass ``llm_coder`` to enable this mode.
+
+    Usage::
+
+        # Single model
+        agent = ExploitAgent(llm_caller, env, profile, trace_path)
+
+        # Dual model (e.g., qwen for exploration, claude for coding)
+        agent = ExploitAgent(llm_caller, env, profile, trace_path,
+                             llm_coder=coder_caller)
+    """
+
+    def __init__(
+        self,
+        llm_caller: Callable[[str, str], str],
+        env: DockerEnv,
+        profile: RepoProfile,
+        trace_path: TracePath,
+        sink_function: str,
+        sink_file: str,
+        config: AgentConfig | None = None,
+        progress_callback: Callable[[str, int], None] | None = None,
+        llm_coder: Callable[[str, str], str] | None = None,
+    ) -> None:
+        self.llm_explore = llm_caller
+        self.llm_code = llm_coder if llm_coder else llm_caller
+        self.dual_model = llm_coder is not None
+        self.env = env
+        self.profile = profile
+        self.trace = trace_path
+        self.sink_function = sink_function
+        self.sink_file = sink_file
+        self.config = config or AgentConfig()
+        self._progress = progress_callback
+        self._exchanges: list[tuple[str, str]] = []  # (assistant, result)
+        self._phase: str = "explore" if self.dual_model else "single"
+        self._exploration_summary: str = ""  # filled when explorer finishes
+        self._last_force_resolve_turn: int = -99  # cooldown tracking
+        self._force_resolve_count: int = 0
+        self._pipeline_ran: bool = False  # post-compile pipeline already executed
+
+        # backward compat: single-caller property
+        self.llm_call = llm_caller
+
+    def run(self) -> AgentResult:
+        """Run the agent loop until success or budget exhaustion."""
+        t0 = time.time()
+        result = AgentResult()
+
+        # Build initial context
+        initial_context = self._build_initial_context()
+
+        # Log system setup
+        result.log.append({
+            "event": "agent_start",
+            "timestamp": time.time(),
+            "phase": self._phase,
+            "dual_model": self.dual_model,
+            "sink_function": self.sink_function,
+            "sink_file": self.sink_file,
+            "repo": self.profile.repo_name,
+            "build_system": self.profile.build_system,
+            "max_turns": self.config.max_turns,
+            "initial_context_length": len(initial_context),
+        })
+
+        for turn in range(self.config.max_turns):
+            turn_log: dict[str, Any] = {
+                "event": "turn",
+                "turn": turn + 1,
+                "phase": self._phase,
+                "timestamp": time.time(),
+            }
+
+            phase_label = f"[{self._phase}]" if self.dual_model else ""
+            if self._progress:
+                self._progress(f"Turn {turn + 1}/{self.config.max_turns} {phase_label}", turn)
+
+            # Select LLM caller and system prompt based on current phase
+            if self._phase == "explore":
+                llm_fn = self.llm_explore
+                system_prompt = _EXPLORER_PROMPT
+                prompt_context = self._build_prompt(initial_context)
+            elif self._phase == "code":
+                llm_fn = self.llm_code
+                system_prompt = _CODER_PROMPT
+                prompt_context = self._build_coder_prompt(initial_context)
+            else:
+                llm_fn = self.llm_explore
+                system_prompt = _SYSTEM_PROMPT
+                prompt_context = self._build_prompt(initial_context)
+
+            turn_log["prompt_length"] = len(prompt_context)
+
+            # Call LLM
+            logger.info("Agent turn %d/%d [%s]", turn + 1, self.config.max_turns, self._phase)
+            try:
+                response = llm_fn(system_prompt, prompt_context)
+            except Exception as exc:
+                logger.error("LLM call failed at turn %d: %s", turn + 1, exc)
+                turn_log["error"] = str(exc)
+                result.log.append(turn_log)
+                continue
+
+            turn_log["llm_response"] = response[:8000]
+
+            # Parse actions
+            actions = parse_actions(response)
+            turn_log["actions_parsed"] = [
+                {"kind": a.kind, "path": a.path, "content_length": len(a.content)}
+                for a in actions
+            ]
+
+            if not actions:
+                # LLM didn't emit any executable actions — redirect it
+                no_action_count = sum(1 for _, r in self._exchanges if "(NO ACTIONS)" in r)
+                redirect_msg = (
+                    "⚠️ NO ACTIONS DETECTED in your response. I need you to use "
+                    "the action format so I can execute commands in the Docker container.\n\n"
+                    "Use <shell>command</shell> tags.\n\n"
+                    "Example — do this RIGHT NOW as your next response:\n"
+                    "<shell>ls /src/ | head -20</shell>\n"
+                    "<shell>find /src -name 'README*' -o -name 'BUILD*' -o -name 'Makefile' | head -10</shell>\n\n"
+                    "Do NOT explain what you plan to do. Just emit the commands."
+                )
+                self._exchanges.append((response[:1000], f"(NO ACTIONS) {redirect_msg}"))
+                turn_log["no_actions"] = True
+                turn_log["redirect"] = redirect_msg
+
+                # If stuck for too many turns, force an exploration command
+                if no_action_count >= 3:
+                    logger.warning("Agent stuck (no actions for %d turns) — forcing exploration", no_action_count)
+                    forced_cmds = [
+                        "ls -la /src/",
+                        "find /src -maxdepth 2 -name '*.h' -path '*/public/*' -o -name '*.h' -path '*/include/*' | head -20",
+                        "find /src -name 'fuzz*' -o -name '*_fuzzer*' | head -10",
+                        "cat /src/BUILD.gn 2>/dev/null || cat /src/CMakeLists.txt 2>/dev/null || cat /src/Makefile 2>/dev/null | head -50",
+                    ]
+                    forced_results = []
+                    for cmd in forced_cmds:
+                        exec_r = self.env.exec(cmd, timeout=30)
+                        forced_results.append(f"$ {cmd}\n{exec_r.output[:1500]}")
+                    forced_output = "\n\n".join(forced_results)
+                    self._exchanges.append((
+                        "(forced exploration)",
+                        f"I ran some exploration commands for you:\n\n{forced_output}\n\n"
+                        "Now based on this output, write a <shell> command or <write_file> to proceed."
+                    ))
+                    turn_log["forced_exploration"] = forced_output[:3000]
+
+                result.log.append(turn_log)
+                continue
+
+            actions = actions[:self.config.max_actions_per_turn]
+
+            # Execute actions
+            action_results: list[str] = []
+            action_logs: list[dict] = []
+            done = False
+
+            for action in actions:
+                result.total_actions += 1
+                action_log: dict[str, Any] = {"kind": action.kind}
+
+                if action.kind == "shell":
+                    exec_r = self.env.exec(action.content, timeout=self.config.exec_timeout)
+                    output = f"[shell] $ {action.content}\n"
+                    output += f"exit_code={exec_r.exit_code}\n"
+                    output += exec_r.output[:4000]
+                    action_results.append(output)
+                    action_log["command"] = action.content
+                    action_log["exit_code"] = exec_r.exit_code
+                    action_log["output"] = exec_r.output[:4000]
+                    action_log["elapsed"] = exec_r.elapsed
+
+                elif action.kind == "write_file":
+                    exec_r = self.env.write_file(action.path, action.content)
+                    if exec_r.success:
+                        action_results.append(f"[write_file] Wrote {len(action.content)} bytes to {action.path}")
+                        action_log["path"] = action.path
+                        action_log["size"] = len(action.content)
+                        action_log["success"] = True
+                        # Reset pipeline flag when new source is written
+                        if action.path.endswith((".cpp", ".cc", ".c")):
+                            self._pipeline_ran = False
+                    else:
+                        action_results.append(f"[write_file] FAILED: {exec_r.stderr}")
+                        action_log["path"] = action.path
+                        action_log["success"] = False
+                        action_log["error"] = exec_r.stderr
+
+                elif action.kind == "read_file":
+                    content = self.env.read_file(action.path)
+                    action_results.append(f"[read_file] {action.path}:\n{content[:3000]}")
+                    action_log["path"] = action.path
+                    action_log["content_length"] = len(content)
+
+                elif action.kind == "submit":
+                    # LLM is declaring it has a working exploit
+                    parts = action.content.split("|", 1)
+                    input_file = parts[0].replace("input=", "").strip() if parts else "/work/input.pdf"
+                    explanation = parts[1] if len(parts) > 1 else action.content
+                    binary_path = action.path
+
+                    logger.info("Agent submitted exploit: %s with input %s", binary_path, input_file)
+                    action_log["binary"] = binary_path
+                    action_log["input"] = input_file
+                    action_log["explanation"] = explanation
+
+                    # Verify the submission
+                    vr = self._run_verification(binary_path, input_file)
+                    result.verification = vr
+                    action_log["verification"] = {
+                        "confirmed": vr.confirmed,
+                        "sink_reached": vr.sink_reached,
+                        "asan_crash": vr.asan_crash,
+                        "asan_crash_type": vr.asan_crash_type,
+                        "asan_in_library": vr.asan_in_library,
+                        "summary": vr.summary,
+                    }
+
+                    verify_msg = (
+                        f"=== SUBMISSION VERIFICATION ===\n"
+                        f"Binary: {binary_path}\n"
+                        f"Input: {input_file}\n"
+                        f"Result: {vr.status_icon} {vr.summary}\n"
+                        f"ASAN crash: {vr.asan_crash} ({vr.asan_crash_type})\n"
+                        f"Crash in library: {vr.asan_in_library}\n"
+                    )
+                    action_results.append(verify_msg)
+
+                    if vr.confirmed:
+                        logger.info("🔴 SUBMISSION VERIFIED: vulnerability confirmed!")
+                        result.success = True
+                        result.harness_path = binary_path
+                        result.input_path = input_file
+                        done = True
+                    else:
+                        # Tell the agent why verification failed
+                        action_results.append(
+                            f"❌ Verification FAILED. {vr.summary}\n"
+                            f"Fix the issue and <submit> again, or keep investigating."
+                        )
+                        if vr.asan_trace:
+                            action_results.append(f"ASAN trace:\n{vr.asan_trace[:2000]}")
+
+                    break
+
+                elif action.kind == "done":
+                    if self._phase == "explore":
+                        self._exploration_summary = action.content
+                        self._transition_to_code(result)
+                        action_log["transition"] = "explore_to_code"
+                        done = False
+                    else:
+                        result.final_reason = action.content
+                        action_log["final_reason"] = action.content
+                        done = True
+                    break
+
+                action_logs.append(action_log)
+
+            # Build result string
+            results_str = "\n\n".join(action_results)
+
+            # Store in turn log
+            turn_log["action_results"] = action_logs
+            turn_log["results_summary"] = results_str[:5000]
+
+            # Store exchange for context
+            self._exchanges.append((
+                response[:3000],
+                results_str[:3000],
+            ))
+
+            result.turns_used = turn + 1
+
+            if done:
+                turn_log["done"] = True
+                turn_log["success"] = result.success
+                result.log.append(turn_log)
+                break
+
+            # ----------------------------------------------------------
+            # Post-compile auto-pipeline
+            # When the LLM compiles a .o successfully, the system takes
+            # over the mechanical steps: link → run → sweep → craft
+            # ----------------------------------------------------------
+            compiled_obj = self._detect_successful_compile(action_logs)
+            if compiled_obj and not result.success and not self._pipeline_ran:
+                # Verify the .o file actually exists on disk
+                obj_check = self.env.exec(f"test -f {compiled_obj} && echo yes", timeout=5)
+                if obj_check.stdout.strip() == "yes":
+                    logger.info("Detected successful .o compilation (%s) — running auto-pipeline", compiled_obj)
+                    turn_log["auto_pipeline_triggered"] = True
+                    turn_log["compiled_object"] = compiled_obj
+                    self._pipeline_ran = True
+                    pipeline_output, pipeline_success = self._post_compile_pipeline(turn_log, result)
+                    if pipeline_output:
+                        results_str += f"\n\n{pipeline_output}"
+                        self._exchanges[-1] = (
+                            self._exchanges[-1][0],
+                            self._exchanges[-1][1] + f"\n\n{pipeline_output}",
+                        )
+                    if pipeline_success:
+                        result.log.append(turn_log)
+                        break
+
+            # ----------------------------------------------------------
+            # Stall detection: is the agent spinning without progress?
+            # ----------------------------------------------------------
+            stall_hint = self._detect_stall(turn, results_str)
+            if stall_hint:
+                logger.warning("Stall detected at turn %d — injecting hint", turn + 1)
+                turn_log["stall_detected"] = True
+
+                # In dual-model mode, exploration stall → force transition to coder
+                if self._phase == "explore" and "EXPLORATION PHASE IS OVER" in stall_hint:
+                    logger.info("Exploration stall → auto-transitioning to coder model")
+                    self._exploration_summary = (
+                        "Exploration was auto-terminated due to stall. "
+                        "The explorer spent too many turns without producing actionable results. "
+                        "Review the exchange history for what was found."
+                    )
+                    self._transition_to_code(result)
+                    turn_log["phase_transition"] = "explore_to_code_stall"
+                    result.log.append(turn_log)
+                    continue
+
+                # If the hint contains a harness template, actually write it
+                if "<write_file" in stall_hint and turn >= 6:
+                    forced_output = self._force_write_harness()
+                    if forced_output:
+                        stall_hint += f"\n\n=== I wrote and compiled the harness for you ===\n{forced_output}"
+                        turn_log["force_write_harness"] = True
+
+                # Linker resolution: auto-run the binary if linking succeeded
+                if "LINKING SUCCEEDED" in stall_hint:
+                    logger.info("Force-resolve produced a working binary!")
+                    turn_log["force_resolve_succeeded"] = True
+                    auto_run_output = self._auto_run_harness()
+                    if auto_run_output:
+                        stall_hint += f"\n\n{auto_run_output}"
+                        turn_log["auto_run_output"] = auto_run_output[:3000]
+
+                        # Check if auto-run found an ASAN crash in the library
+                        if "ASAN ERROR DETECTED INSIDE THE LIBRARY" in auto_run_output:
+                            logger.info("🔴 Auto-run detected ASAN crash in library!")
+                            result.success = True
+                            result.harness_path = "/work/harness"
+                            input_r = self.env.exec(
+                                "ls /work/input.pdf /work/input.* 2>/dev/null | head -1",
+                                timeout=5,
+                            )
+                            input_file = input_r.stdout.strip().split("\n")[0] if input_r.stdout.strip() else "/work/input.pdf"
+                            result.input_path = input_file
+                            vr = self._run_verification("/work/harness", input_file)
+                            result.verification = vr
+                            turn_log["auto_run_crash"] = True
+                            turn_log["verification"] = {
+                                "confirmed": vr.confirmed,
+                                "asan_crash_type": vr.asan_crash_type,
+                                "summary": vr.summary,
+                            }
+                            self._exchanges[-1] = (
+                                self._exchanges[-1][0],
+                                self._exchanges[-1][1] + f"\n\n{stall_hint}",
+                            )
+                            result.log.append(turn_log)
+                            break  # Done — vulnerability confirmed
+
+                        # Check if it ran clean — try sweeping test inputs
+                        if "Harness ran without crashing" in auto_run_output:
+                            sweep_output = self._sweep_test_inputs()
+                            if sweep_output:
+                                stall_hint += f"\n\n{sweep_output}"
+                                turn_log["sweep_output"] = sweep_output[:3000]
+                                if "ASAN ERROR DETECTED INSIDE THE LIBRARY" in sweep_output:
+                                    logger.info("🔴 Input sweep found ASAN crash!")
+                                    result.success = True
+                                    result.harness_path = "/work/harness"
+                                    turn_log["sweep_crash"] = True
+                                    self._exchanges[-1] = (
+                                        self._exchanges[-1][0],
+                                        self._exchanges[-1][1] + f"\n\n{stall_hint}",
+                                    )
+                                    result.log.append(turn_log)
+                                    break
+
+                turn_log["stall_hint"] = stall_hint[:3000]
+                self._exchanges[-1] = (
+                    self._exchanges[-1][0],
+                    self._exchanges[-1][1] + f"\n\n{stall_hint}",
+                )
+
+            # In dual-model explore phase, auto-transition if agent writes code
+            if self._phase == "explore":
+                wrote_code = any(
+                    a.kind == "write_file" and a.path.endswith((".cpp", ".cc", ".c", ".h"))
+                    for a in actions
+                )
+                if wrote_code:
+                    logger.info("Explorer wrote code — auto-transitioning to coder model")
+                    self._exploration_summary = (
+                        "The explorer started writing code. Transition to coder phase. "
+                        "Continue from where the explorer left off."
+                    )
+                    self._transition_to_code(result)
+                    turn_log["phase_transition"] = "explore_to_code_wrote_code"
+
+            # Auto-verify: check if the agent compiled and ran something
+            check = self.env.exec("ls /work/harness* /work/*.bin 2>/dev/null")
+            if check.success and check.stdout.strip():
+                input_check = self.env.exec("ls /work/input* /work/seed* /work/*.pdf /work/*.xml 2>/dev/null")
+                input_file = ""
+                if input_check.success and input_check.stdout.strip():
+                    input_file = input_check.stdout.strip().split("\n")[0]
+
+                binary = check.stdout.strip().split("\n")[0]
+
+                if input_file and binary:
+                    vr = self._run_verification(binary, input_file)
+                    result.verification = vr
+                    turn_log["auto_verify"] = {
+                        "binary": binary,
+                        "input": input_file,
+                        "confirmed": vr.confirmed,
+                        "sink_reached": vr.sink_reached,
+                        "asan_crash": vr.asan_crash,
+                        "asan_crash_type": vr.asan_crash_type,
+                    }
+
+                    if vr.confirmed:
+                        logger.info("🔴 VERIFIED: vulnerability confirmed!")
+                        result.success = True
+                        result.harness_path = binary
+                        result.input_path = input_file
+                        verify_msg = (
+                            f"\n\n=== AUTOMATIC VERIFICATION ===\n"
+                            f"Status: {vr.status_icon}\n"
+                            f"Result: {vr.summary}\n"
+                            f"ASAN crash: {vr.asan_crash} ({vr.asan_crash_type})\n"
+                            f"Crash in library: {vr.asan_in_library}\n"
+                        )
+                        self._exchanges[-1] = (
+                            self._exchanges[-1][0],
+                            self._exchanges[-1][1] + verify_msg,
+                        )
+                        turn_log["success"] = True
+                        result.log.append(turn_log)
+                        break
+
+                    elif vr.harness_crashed_itself:
+                        warn_msg = (
+                            f"\n\n=== AUTOMATIC VERIFICATION WARNING ===\n"
+                            f"The crash occurred in YOUR HARNESS CODE at {vr.asan_location}, "
+                            f"not inside the library. This is a FALSE POSITIVE.\n"
+                            f"Fix your harness — the crash must be inside the target library.\n"
+                            f"ASAN trace:\n{vr.asan_trace[:1500]}\n"
+                        )
+                        self._exchanges[-1] = (
+                            self._exchanges[-1][0],
+                            self._exchanges[-1][1] + warn_msg,
+                        )
+
+                    elif vr.sink_reached:
+                        info_msg = (
+                            f"\n\n=== VERIFICATION UPDATE ===\n"
+                            f"Sink function {self.sink_function} was REACHED but no crash.\n"
+                            f"Try crafting inputs that violate the conditions along the trace path.\n"
+                        )
+                        self._exchanges[-1] = (
+                            self._exchanges[-1][0],
+                            self._exchanges[-1][1] + info_msg,
+                        )
+
+            # Append turn log
+            result.log.append(turn_log)
+
+        result.elapsed_seconds = round(time.time() - t0, 2)
+
+        # Generate post-mortem if the agent failed
+        if not result.success:
+            result.postmortem = self._generate_postmortem(result)
+
+        result.log.append({
+            "event": "agent_end",
+            "timestamp": time.time(),
+            "success": result.success,
+            "turns_used": result.turns_used,
+            "total_actions": result.total_actions,
+            "elapsed_seconds": result.elapsed_seconds,
+            "final_reason": result.final_reason,
+            "harness_path": result.harness_path,
+            "input_path": result.input_path,
+            "postmortem": result.postmortem,
+        })
+        return result
+
+    # ------------------------------------------------------------------
+    # Stall detection
+    # ------------------------------------------------------------------
+
+    def _detect_stall(self, turn: int, latest_results: str) -> str | None:
+        """Detect if the agent is stuck and inject progressively stronger hints.
+
+        Tracks three phases:
+          1. EXPLORE (find/ls/cat/grep only)
+          2. BUILD (g++/gcc/make/cmake compile commands)
+          3. TEST (running a binary with input)
+
+        If the agent stays in EXPLORE too long, it gets pushed to BUILD.
+        If BUILD keeps failing the same way, it gets a different approach.
+        """
+        if turn < 3:
+            return None
+
+        recent = self._exchanges[-6:]  # last 6 turns
+
+        # Classify each turn by what actions were actually executed
+        explore_turns = 0
+        build_turns = 0
+        write_turns = 0
+        test_turns = 0
+        for resp, res in recent:
+            has_write = "[write_file]" in res
+            has_compile = any(k in res for k in (
+                "g++ ", "gcc ", "clang ", "make ", "cmake ", "ninja ",
+                "g++:", "gcc:", "clang:", "error:", "undefined reference",
+            ))
+            has_run = any(k in res for k in (
+                "./harness", "/work/harness", "ASAN", "AddressSanitizer",
+                "Segmentation fault", "SUMMARY:",
+            ))
+            has_explore = any(k in res for k in ("exit_code=0\n/", "[shell] $ cat ", "[shell] $ find ", "[shell] $ grep ", "[shell] $ ls ", "[shell] $ sed "))
+
+            if has_run:
+                test_turns += 1
+            elif has_compile:
+                build_turns += 1
+            elif has_write:
+                write_turns += 1
+            else:
+                explore_turns += 1
+
+        # --- Pattern 1: Build tool not found ---
+        all_results = "\n".join(r for _, r in recent)
+        not_found_tools = set()
+        for tool in ("gn", "cmake", "meson", "bazel", "cargo", "scons", "waf"):
+            count = all_results.lower().count(f"{tool}: command not found") + \
+                    all_results.lower().count(f"{tool}: not found")
+            if count >= 2:
+                not_found_tools.add(tool)
+
+        if not_found_tools:
+            tools_str = ", ".join(sorted(not_found_tools))
+            # Find existing fuzz harnesses to use as reference
+            fuzz_check = self.env.exec(
+                "find /src -name '*fuzz*' -name '*.cc' | head -5", timeout=10,
+            )
+            fuzz_files = fuzz_check.stdout.strip() if fuzz_check.success else ""
+            ref_hint = ""
+            if fuzz_files:
+                first_fuzz = fuzz_files.split("\n")[0]
+                ref_hint = f"\nThere are existing fuzz harnesses you can reference:\n{fuzz_files}\nRead one with: cat {first_fuzz} | head -80\n"
+
+            return (
+                f"⚠️ STOP: {tools_str} is not installed. The full build system is NOT available.\n\n"
+                f"You have two options:\n"
+                f"A) Write a harness using the PUBLIC API (fpdfview.h) — this doesn't need {tools_str}.\n"
+                f"   Just link against the .o files you compile from source.\n"
+                f"B) Find an EXISTING fuzz harness and adapt it.\n"
+                f"{ref_hint}\n"
+                f"DO NOT search for {tools_str} again. Write code NOW with <write_file>."
+            )
+
+        # --- Pattern 2: Stuck in exploration phase ---
+        if explore_turns >= 4 and write_turns == 0 and build_turns == 0 and turn >= 5:
+            # Agent has been exploring for too long — inject a concrete harness
+            return self._generate_harness_hint()
+
+        # --- Pattern 3: Wrote harness but never tried to compile ---
+        if write_turns >= 2 and build_turns == 0 and turn >= 8:
+            return (
+                "⚠️ You've written files but never tried to compile them.\n\n"
+                "Try compiling NOW:\n"
+                "<shell>g++ -fsanitize=address -g -std=c++17 -I/src -I/src/public "
+                "/work/harness.cpp -c -o /work/harness.o 2>&1 | head -30</shell>\n\n"
+                "Even if it fails, the error will tell you what's missing."
+            )
+
+        # --- Pattern 4: Linker "cannot find -l" / searching for .a/.so loop ---
+        # .o compiles but linking fails because no pre-built library exists
+        linker_failures = 0
+        has_successful_compile = False
+        searching_for_lib = 0
+        for resp, res in recent:
+            if "cannot find -l" in res:
+                linker_failures += 1
+            if ("No such file or directory" in res and
+                    (".a" in res or ".so" in res or "-l" in res)):
+                linker_failures += 1
+            if "undefined reference to" in res and "ld:" in res:
+                linker_failures += 1
+            if "exit_code=0" in res and ("-c -o" in res or "-c -o" in resp):
+                has_successful_compile = True
+            combined = resp + " " + res
+            if (("find" in combined or "ls" in combined) and
+                    (".so" in combined or ".a" in combined or
+                     "lib" in combined) and
+                    "(no output)" in res):
+                searching_for_lib += 1
+
+        if (linker_failures >= 2 or searching_for_lib >= 3) and has_successful_compile:
+            # Cooldown: if binary already exists and was recently built, just tell
+            # the agent to RUN it instead of rebuilding from scratch
+            binary_exists = self.env.exec(
+                "test -x /work/harness && echo yes", timeout=5,
+            ).stdout.strip() == "yes"
+            turns_since_last = turn - self._last_force_resolve_turn
+
+            if binary_exists and turns_since_last < 8:
+                # Find an input file
+                input_r = self.env.exec(
+                    "ls /work/input.pdf /work/input.* /src/testing/resources/hello_world.pdf "
+                    "2>/dev/null | head -1", timeout=5,
+                )
+                input_file = input_r.stdout.strip().split("\n")[0] if input_r.stdout.strip() else "/work/input.pdf"
+
+                return (
+                    "⚠️ /work/harness already exists and is executable.\n"
+                    "STOP searching for libraries. STOP recompiling. The binary is READY.\n\n"
+                    "RUN IT NOW with:\n"
+                    f"<shell>/work/harness {input_file} 2>&1 | head -80</shell>\n\n"
+                    "If it runs without crashing, try:\n"
+                    "- Different PDF files: ls /src/testing/resources/*.pdf | head -20\n"
+                    "- Malformed input: create a corrupted PDF with truncated/modified bytes\n"
+                    "- More API calls: add more functions from the vulnerability trace to the harness\n\n"
+                    "Do NOT search for .a/.so files. Do NOT try -lpdfium. Just RUN the binary."
+                )
+
+            # First time or cooldown expired — do the full resolution
+            self._last_force_resolve_turn = turn
+            self._force_resolve_count += 1
+            return self._generate_linking_hint()
+
+        # --- Pattern 5: Same compilation error repeated ---
+        compile_errors = []
+        for _, r in recent:
+            if "error:" in r and any(k in r for k in ("g++", "gcc", "clang")):
+                for line in r.split("\n"):
+                    if "error:" in line:
+                        compile_errors.append(line.strip()[:100])
+                        break
+        if len(compile_errors) >= 3 and len(set(compile_errors)) == 1:
+            return (
+                f"⚠️ Same error 3 times: {compile_errors[0][:80]}\n\n"
+                "Try a DIFFERENT approach:\n"
+                "- Missing header → find /src -name 'header.h' and add -I flag\n"
+                "- Missing symbol → compile more source files or use a different function\n"
+                "- Template/C++ issue → try -std=c++20\n"
+                "Do NOT repeat the same command."
+            )
+
+        # --- Pattern 6: Repeated identical commands ---
+        recent_cmds = []
+        for a, _ in recent:
+            for m in re.finditer(r"\[shell\] \$ (.+)", a):
+                recent_cmds.append(m.group(1).strip()[:80])
+        if len(recent_cmds) >= 6:
+            from collections import Counter
+            counts = Counter(recent_cmds)
+            repeated = [cmd for cmd, n in counts.items() if n >= 3]
+            if repeated:
+                return (
+                    f"⚠️ You've run '{repeated[0][:60]}' {counts[repeated[0]]} times.\n"
+                    "This is not productive. Do something DIFFERENT."
+                )
+
+        return None
+
+    def _generate_linking_hint(self) -> str:
+        """Generate a concrete hint for resolving linker failures.
+
+        Called when the harness .o compiles fine but linking fails because
+        there's no pre-built library. Runs nm, finds source files, and
+        tries to compile them.
+        """
+        # Step 1: Find what symbols the harness needs
+        nm_r = self.env.exec(
+            "nm /work/harness.o 2>/dev/null | grep ' U ' | "
+            "grep -v '__asan\\|__cxa\\|__stack\\|_Unwind\\|__gxx\\|_GLOBAL\\|_Z.*std' | "
+            "awk '{print $2}' | head -20",
+            timeout=10,
+        )
+        if not nm_r.success or not nm_r.stdout.strip():
+            return (
+                "⚠️ LINKER STALL: No pre-built library exists in this repo.\n"
+                "The project needs its build system (gn/cmake/etc.) to create the library.\n\n"
+                "ALTERNATIVE: Compile source files directly.\n"
+                "1. Find which .cc/.cpp files implement the functions your harness calls\n"
+                "2. Compile them individually: g++ -c -I/src file.cc -o file.o\n"
+                "3. Link all .o files together with your harness\n"
+            )
+
+        undefined_symbols = [s.strip() for s in nm_r.stdout.strip().split("\n") if s.strip()]
+
+        parts = [
+            "⚠️ LINKER STALL DETECTED: There is NO pre-built library (.a or .so) in this repo.",
+            "STOP searching for libpdfium or any .a/.so files — they do not exist.",
+            "The library was never compiled. You must compile source files directly.",
+            "",
+            f"Your harness.o needs these {len(undefined_symbols)} symbols:",
+        ]
+        for s in undefined_symbols[:15]:
+            parts.append(f"  {s}")
+
+        # Step 2: Find source files that define these symbols
+        # Use the first few symbols to search
+        search_symbols = undefined_symbols[:5]
+        source_files_found: dict[str, list[str]] = {}  # file → symbols it defines
+
+        for sym in search_symbols:
+            # Demangle C++ symbol to get function name
+            demangle_r = self.env.exec(f"echo '{sym}' | c++filt 2>/dev/null", timeout=5)
+            demangled = demangle_r.stdout.strip() if demangle_r.success else sym
+
+            # Extract just the function name (last component before '(')
+            func_name = demangled.split("(")[0].split("::")[-1].split("<")[0].strip()
+            if len(func_name) < 3:
+                continue
+
+            # Search for definition in source files
+            grep_r = self.env.exec(
+                f"grep -rn '{func_name}' /src/ "
+                f"--include='*.cc' --include='*.cpp' --include='*.c' -l 2>/dev/null | "
+                f"grep -v '_test\\|_unittest\\|_fuzzer\\|_embeddertest' | head -5",
+                timeout=15,
+            )
+            if grep_r.success and grep_r.stdout.strip():
+                for f in grep_r.stdout.strip().split("\n"):
+                    f = f.strip()
+                    if f:
+                        source_files_found.setdefault(f, []).append(func_name)
+
+        if source_files_found:
+            parts.append("")
+            parts.append("I found these source files that likely define the needed symbols:")
+            # Sort by number of symbols matched (most relevant first)
+            ranked = sorted(source_files_found.items(), key=lambda x: -len(x[1]))
+            for f, syms in ranked[:10]:
+                parts.append(f"  {f} (defines: {', '.join(syms[:3])})")
+
+            # Step 3: Try compiling the top source files
+            parts.append("")
+            parts.append("=== Attempting to compile source files ===")
+
+            compiled_objects: list[str] = []
+            top_files = [f for f, _ in ranked[:5]]
+
+            for src_file in top_files:
+                obj_name = src_file.replace("/", "_").replace(".cc", ".o").replace(".cpp", ".o").replace(".c", ".o")
+                obj_path = f"/work/{obj_name}"
+                compile_r = self.env.exec(
+                    f"g++ -fsanitize=address -g -std=c++20 -I/src -I/src/public "
+                    f"-c {src_file} -o {obj_path} 2>&1",
+                    timeout=60,
+                )
+                # Check if .o was actually created (pipe would hide real exit code)
+                obj_exists = self.env.exec(
+                    f"test -f {obj_path} && echo yes", timeout=5,
+                ).stdout.strip() == "yes"
+                if obj_exists:
+                    compiled_objects.append(obj_path)
+                    parts.append(f"  ✅ {src_file} → {obj_path}")
+                else:
+                    first_err = compile_r.output.strip().split("\n")[0][:120] if compile_r.output.strip() else "unknown error"
+                    parts.append(f"  ❌ {src_file}: {first_err}")
+
+            if compiled_objects:
+                # Step 4: Try linking with compiled objects
+                objs_str = " ".join(compiled_objects)
+                link_r = self.env.exec(
+                    f"g++ -fsanitize=address -g -std=c++20 -I/src -I/src/public "
+                    f"/work/harness.o {objs_str} -o /work/harness -lpthread -ldl 2>&1",
+                    timeout=60,
+                )
+                parts.append("")
+                # Check if binary was created
+                linked_ok = self.env.exec(
+                    "test -x /work/harness && echo yes", timeout=5,
+                ).stdout.strip() == "yes"
+                if linked_ok:
+                    parts.append("✅ LINKING SUCCEEDED! Try running: /work/harness /work/input.pdf")
+                else:
+                    # Extract remaining undefined symbols
+                    remaining = []
+                    for line in link_r.output.split("\n"):
+                        if "undefined reference to" in line:
+                            m = re.search(r"undefined reference to `([^']+)'", line)
+                            if m:
+                                remaining.append(m.group(1)[:60])
+                    remaining = list(dict.fromkeys(remaining))[:10]  # dedupe
+
+                    parts.append(f"❌ Linking still has {len(remaining)} undefined symbols:")
+                    for r in remaining[:8]:
+                        parts.append(f"    {r}")
+                    parts.append("")
+                    parts.append(
+                        "You need to compile more source files to resolve these.\n"
+                        "Search for them: grep -rn 'FUNCTION_NAME' /src --include='*.cc' -l\n"
+                        "Then compile each: g++ -c -std=c++20 -I/src FILE.cc -o FILE.o\n"
+                        "Then link all .o files together."
+                    )
+            else:
+                parts.append("")
+                parts.append(
+                    "❌ None of the source files compiled individually.\n"
+                    "This repo has complex build dependencies that require the full\n"
+                    "build system. Consider a DIFFERENT approach:\n\n"
+                    "OPTION A: Use the internal C++ API directly (skip the public C API).\n"
+                    "  Look at the existing tests/fuzzers — they #include internal headers\n"
+                    "  and call C++ classes directly.\n\n"
+                    "OPTION B: Compile a minimal subset of the trace files.\n"
+                    "  Look at which .cc/.cpp files are in the trace, compile only those,\n"
+                    "  and stub out any missing dependencies with empty functions.\n\n"
+                    "OPTION C: Use the repo's own test infrastructure.\n"
+                    "  Find existing test programs that already link against the library.\n"
+                    "  Look for: find /src -name '*test*.cc' -o -name '*_test.cpp' | head -10\n"
+                    "  Copy one and modify it to exercise the vulnerability trace."
+                )
+        else:
+            # Build generic search commands from the actual undefined symbols
+            search_cmds = []
+            for sym in undefined_symbols[:3]:
+                demangle_r = self.env.exec(f"echo '{sym}' | c++filt 2>/dev/null", timeout=5)
+                func = demangle_r.stdout.strip().split("(")[0].split("::")[-1] if demangle_r.success else sym
+                if len(func) >= 3:
+                    search_cmds.append(
+                        f"<shell>grep -rn '{func}' /src --include='*.cc' --include='*.cpp' -l | "
+                        f"grep -v test | head -5</shell>"
+                    )
+            parts.append("")
+            parts.append(
+                "Could not find source files for the needed symbols.\n"
+                "Try searching manually:\n" + "\n".join(search_cmds)
+            )
+
+        return "\n".join(parts)
+
+    def _generate_harness_hint(self) -> str:
+        """Generate a concrete harness template based on the trace and repo."""
+        # Check what public API is available
+        api_check = self.env.exec(
+            "grep -h 'FPDF_EXPORT\\|DLLEXPORT' /src/public/fpdfview.h 2>/dev/null | head -15",
+            timeout=10,
+        )
+        api_funcs = api_check.stdout.strip() if api_check.success else ""
+
+        # Check for existing fuzz harnesses
+        fuzz_check = self.env.exec(
+            "cat $(find /src -name '*fuzz*' -name '*.cc' | head -1) 2>/dev/null | head -40",
+            timeout=10,
+        )
+        fuzz_ref = fuzz_check.stdout.strip() if fuzz_check.success else ""
+
+        # Check for test PDFs
+        pdf_check = self.env.exec(
+            "ls /src/testing/resources/*.pdf 2>/dev/null | head -5",
+            timeout=10,
+        )
+        pdf_files = pdf_check.stdout.strip() if pdf_check.success else ""
+
+        hint_parts = [
+            "⚠️ EXPLORATION PHASE IS OVER. Time to write code.\n",
+            "You've gathered enough information. Write a harness NOW.\n\n",
+        ]
+
+        if fuzz_ref:
+            hint_parts.append(
+                f"Here's an existing fuzzer from the repo for reference:\n"
+                f"```\n{fuzz_ref[:1500]}\n```\n\n"
+            )
+
+        hint_parts.append(
+            "Write your harness with <write_file>. Here's a template:\n\n"
+            '<write_file path="/work/harness.cpp">\n'
+            '#include <stdio.h>\n'
+            '#include <stdlib.h>\n'
+            '#include <string.h>\n'
+            '#include "public/fpdfview.h"\n\n'
+            'int main(int argc, char* argv[]) {\n'
+            '    if (argc < 2) { fprintf(stderr, "Usage: %s <pdf>\\n", argv[0]); return 1; }\n'
+            '    FILE* f = fopen(argv[1], "rb");\n'
+            '    if (!f) { perror("fopen"); return 1; }\n'
+            '    fseek(f, 0, SEEK_END);\n'
+            '    long len = ftell(f);\n'
+            '    fseek(f, 0, SEEK_SET);\n'
+            '    char* buf = (char*)malloc(len);\n'
+            '    fread(buf, 1, len, f);\n'
+            '    fclose(f);\n\n'
+            '    FPDF_LIBRARY_CONFIG config = {2, NULL, NULL, 0};\n'
+            '    FPDF_InitLibraryWithConfig(&config);\n'
+            '    FPDF_DOCUMENT doc = FPDF_LoadMemDocument(buf, len, NULL);\n'
+            '    if (doc) {\n'
+            '        int pages = FPDF_GetPageCount(doc);\n'
+            '        for (int i = 0; i < pages && i < 10; i++) {\n'
+            '            FPDF_PAGE page = FPDF_LoadPage(doc, i);\n'
+            '            if (page) FPDF_ClosePage(page);\n'
+            '        }\n'
+            '        FPDF_CloseDocument(doc);\n'
+            '    }\n'
+            '    FPDF_DestroyLibrary();\n'
+            '    free(buf);\n'
+            '    return 0;\n'
+            '}\n'
+            '</write_file>\n\n'
+        )
+
+        if pdf_files:
+            first_pdf = pdf_files.split("\n")[0]
+            hint_parts.append(
+                f"Then compile and test:\n"
+                f"<shell>g++ -fsanitize=address -g -std=c++17 -I/src -I/src/public "
+                f"/work/harness.cpp -c -o /work/harness.o 2>&1 | head -30</shell>\n\n"
+                f"Seed PDF: {first_pdf}\n"
+            )
+
+        return "".join(hint_parts)
+
+    def _force_write_harness(self) -> str:
+        """Actually write a starter harness and attempt compilation.
+
+        Called when the agent has been exploring for too long. We write
+        a minimal harness, try to compile it, and return the results so
+        the LLM can iterate from a concrete starting point instead of
+        continuing to explore.
+        """
+        harness_code = (
+            '#include <stdio.h>\n'
+            '#include <stdlib.h>\n'
+            '#include <string.h>\n'
+            '#include "public/fpdfview.h"\n\n'
+            'int main(int argc, char* argv[]) {\n'
+            '    if (argc < 2) { fprintf(stderr, "Usage: %s <pdf>\\n", argv[0]); return 1; }\n'
+            '    FILE* f = fopen(argv[1], "rb");\n'
+            '    if (!f) { perror("fopen"); return 1; }\n'
+            '    fseek(f, 0, SEEK_END);\n'
+            '    long len = ftell(f);\n'
+            '    fseek(f, 0, SEEK_SET);\n'
+            '    char* buf = (char*)malloc(len);\n'
+            '    fread(buf, 1, len, f);\n'
+            '    fclose(f);\n\n'
+            '    FPDF_LIBRARY_CONFIG config = {2, NULL, NULL, 0};\n'
+            '    FPDF_InitLibraryWithConfig(&config);\n'
+            '    FPDF_DOCUMENT doc = FPDF_LoadMemDocument(buf, len, NULL);\n'
+            '    if (doc) {\n'
+            '        int pages = FPDF_GetPageCount(doc);\n'
+            '        for (int i = 0; i < pages && i < 10; i++) {\n'
+            '            FPDF_PAGE page = FPDF_LoadPage(doc, i);\n'
+            '            if (page) FPDF_ClosePage(page);\n'
+            '        }\n'
+            '        FPDF_CloseDocument(doc);\n'
+            '    }\n'
+            '    FPDF_DestroyLibrary();\n'
+            '    free(buf);\n'
+            '    return 0;\n'
+            '}\n'
+        )
+
+        parts = []
+
+        # Write the harness
+        wr = self.env.write_file("/work/harness.cpp", harness_code)
+        if wr.success:
+            parts.append("✅ Wrote /work/harness.cpp (starter harness)")
+        else:
+            parts.append(f"❌ Failed to write harness: {wr.stderr}")
+            return "\n".join(parts)
+
+        # Try to compile (just -c to see what headers are missing)
+        compile_r = self.env.exec(
+            "g++ -fsanitize=address -g -std=c++17 -I/src -I/src/public "
+            "/work/harness.cpp -c -o /work/harness.o 2>&1",
+            timeout=60,
+        )
+        parts.append(f"$ g++ -c /work/harness.cpp")
+        parts.append(compile_r.output[:2000] if compile_r.output else "(no output)")
+
+        # Check if .o was actually created
+        obj_exists = self.env.exec(
+            "test -f /work/harness.o && echo yes", timeout=5,
+        ).stdout.strip() == "yes"
+
+        if obj_exists:
+            parts.append("\n✅ Compilation to .o succeeded!")
+            parts.append(
+                "Now you need to find what other .o files or libraries to link against.\n"
+                "Try: nm /work/harness.o | grep ' U ' to see undefined symbols.\n"
+                "Then find which source files define them."
+            )
+        else:
+            parts.append(
+                "\n❌ Compilation failed. Read the errors above and fix the harness.\n"
+                "Common fixes: add missing -I paths, or find the right header names."
+            )
+
+        # Copy a test PDF
+        pdf_r = self.env.exec(
+            "cp $(ls /src/testing/resources/hello_world.pdf 2>/dev/null || "
+            "ls /src/testing/resources/*.pdf 2>/dev/null | head -1) "
+            "/work/input.pdf 2>/dev/null && echo 'Copied test PDF' || echo 'No test PDF found'",
+            timeout=10,
+        )
+        parts.append(pdf_r.output.strip())
+
+        return "\n".join(parts)
+
+    def _auto_run_harness(self) -> str:
+        """Auto-run the harness binary with a test input and return the output.
+
+        Called when force-resolve produces a working binary. Instead of
+        waiting for the LLM to run it (which weak models often don't),
+        we run it ourselves and feed the ASAN output back.
+        """
+        parts = ["=== AUTO-RUN: Executing /work/harness with test input ==="]
+
+        # Make sure input exists
+        input_check = self.env.exec(
+            "ls /work/input.pdf /work/input.* 2>/dev/null | head -1",
+            timeout=5,
+        )
+        input_file = input_check.stdout.strip().split("\n")[0] if input_check.success and input_check.stdout.strip() else ""
+
+        if not input_file:
+            # Try to copy one
+            self.env.exec(
+                "cp $(ls /src/testing/resources/hello_world.pdf 2>/dev/null || "
+                "ls /src/testing/resources/*.pdf 2>/dev/null | head -1) "
+                "/work/input.pdf 2>/dev/null",
+                timeout=10,
+            )
+            input_file = "/work/input.pdf"
+
+        # Run the harness (no pipe — need real exit code and full ASAN output)
+        run_r = self.env.exec(
+            f"timeout 20 /work/harness {input_file} 2>&1",
+            timeout=30,
+        )
+        parts.append(f"$ /work/harness {input_file}")
+        parts.append(f"exit_code={run_r.exit_code}")
+        parts.append(run_r.output[:3000] if run_r.output else "(no output)")
+
+        # Interpret the result
+        output = run_r.output or ""
+        no_error = "ERROR" not in output.upper() and "ASAN" not in output.upper()
+        clean_exit = run_r.exit_code == 0 or (run_r.exit_code == 124 and no_error)  # 124 = timeout
+        if clean_exit and no_error:
+            parts.append(
+                "\n✅ Harness ran without crashing. This means:\n"
+                "- The binary works and can load the PDF\n"
+                "- No ASAN error with this particular input\n\n"
+                "NEXT STEPS for the coder:\n"
+                "1. Try other PDF files: ls /src/testing/resources/*.pdf | head -20\n"
+                "2. Try MALFORMED inputs: create a corrupted PDF to trigger the bug\n"
+                "3. Try accessing more API functions along the vulnerability trace\n"
+                "4. Try exercising the specific code path from the trace"
+            )
+        elif "AddressSanitizer" in output or "ASAN" in output:
+            # Check if crash is in library or harness
+            if "/work/harness" in output and "/src/" not in output:
+                parts.append(
+                    "\n⚠️ ASAN error detected but it's in the HARNESS code, not the library.\n"
+                    "Fix the harness code — the crash must be inside /src/ library code."
+                )
+            elif "/src/" in output:
+                parts.append(
+                    "\n🔴 ASAN ERROR DETECTED INSIDE THE LIBRARY!\n"
+                    "This may be the vulnerability. Check the stack trace above.\n"
+                    "The coder should analyze the output and confirm it matches the trace."
+                )
+            else:
+                parts.append(
+                    "\n⚠️ ASAN error detected. Check the stack trace to see if it's\n"
+                    "in the library (/src/) or in the harness (/work/)."
+                )
+        elif run_r.exit_code != 0:
+            parts.append(
+                f"\n❌ Harness exited with code {run_r.exit_code}.\n"
+                "This could be a crash. Check the output above.\n"
+                "If it's a segfault, try running with: "
+                f"gdb -batch -ex run -ex bt /work/harness --args /work/harness {input_file}"
+            )
+        else:
+            parts.append(
+                "\nHarness produced output but no clear crash.\n"
+                "Try different input files or modify the harness to exercise\n"
+                "more of the vulnerability trace."
+            )
+
+        return "\n".join(parts)
+
+    def _sweep_test_inputs(self) -> str:
+        """Try every test file in the repo as input to the harness.
+
+        Pure Python — no LLM needed. Many real vulnerabilities trigger
+        on existing test files.
+        """
+        parts = ["=== AUTO-SWEEP: Trying all test inputs ==="]
+
+        # Find test files (PDFs, XMLs, images, etc.)
+        find_r = self.env.exec(
+            "find /src/testing /src/test /src/tests /src/testdata "
+            "/src/test_data /src/resources /src/samples "
+            "-type f \\( -name '*.pdf' -o -name '*.xml' -o -name '*.png' "
+            "-o -name '*.jpg' -o -name '*.bin' -o -name '*.dat' "
+            "-o -name '*.txt' -o -name '*.tif' -o -name '*.tiff' \\) "
+            "2>/dev/null | head -50",
+            timeout=15,
+        )
+
+        if not find_r.success or not find_r.stdout.strip():
+            parts.append("No test files found in the repo.")
+            return "\n".join(parts)
+
+        test_files = [f.strip() for f in find_r.stdout.strip().split("\n") if f.strip()]
+        parts.append(f"Found {len(test_files)} test files. Testing each...")
+
+        crashes: list[tuple[str, str]] = []  # (file, output)
+
+        for i, tf in enumerate(test_files):
+            run_r = self.env.exec(
+                f"timeout 10 /work/harness {tf} 2>&1",
+                timeout=15,
+            )
+            output = run_r.output or ""
+
+            if "AddressSanitizer" in output and "/src/" in output:
+                parts.append(f"  🔴 CRASH: {tf}")
+                parts.append(f"     exit_code={run_r.exit_code}")
+                # Extract crash type
+                for line in output.split("\n"):
+                    if "ERROR:" in line and "AddressSanitizer" in line:
+                        parts.append(f"     {line.strip()[:120]}")
+                        break
+                crashes.append((tf, output))
+                # Found one — no need to test all
+                break
+            elif run_r.exit_code != 0 and run_r.exit_code not in (1, -1):
+                parts.append(f"  ⚠️ Non-zero exit ({run_r.exit_code}): {tf}")
+            # Skip logging clean runs to keep output short
+
+        if crashes:
+            crash_file, crash_output = crashes[0]
+            parts.append(f"\n🔴 ASAN ERROR DETECTED INSIDE THE LIBRARY!")
+            parts.append(f"Triggering input: {crash_file}")
+            parts.append(f"\nASAN output (first 2000 chars):")
+            parts.append(crash_output[:2000])
+
+            # Copy the crashing input to /work for easy access
+            self.env.exec(f"cp {crash_file} /work/crash_input", timeout=5)
+            parts.append(f"\nCrash input copied to /work/crash_input")
+        else:
+            parts.append(f"\n✅ All {len(test_files)} test files ran without ASAN crashes.")
+            parts.append("The vulnerability may need a specifically crafted input.")
+
+        return "\n".join(parts)
+
+    # ------------------------------------------------------------------
+    # Post-compile auto-pipeline
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _detect_successful_compile(action_logs: list[dict]) -> str:
+        """Check if any action produced a successful .o compilation."""
+        for al in action_logs:
+            if al.get("kind") != "shell":
+                continue
+            cmd = al.get("command", "")
+            # Look for compile commands (regardless of exit code — pipes break it)
+            if "-c" in cmd and "-o" in cmd and (
+                cmd.strip().startswith("g++") or cmd.strip().startswith("gcc") or
+                cmd.strip().startswith("clang")
+            ):
+                # Check output for errors — if stderr has "error:", compilation failed
+                output = al.get("output", "")
+                if "error:" in output and ("fatal error" in output or ": error:" in output):
+                    continue  # compilation failed
+
+                # Extract the .o path
+                parts = cmd.split()
+                for i, p in enumerate(parts):
+                    if p == "-o" and i + 1 < len(parts):
+                        obj_path = parts[i + 1]
+                        if obj_path.endswith(".o"):
+                            return obj_path
+        return ""
+
+    def _post_compile_pipeline(
+        self,
+        turn_log: dict[str, Any],
+        result: AgentResult,
+    ) -> tuple[str, bool]:
+        """Auto-pipeline after successful .o compilation.
+
+        Steps:
+          1. Link: resolve undefined symbols, compile deps, produce binary
+          2. Run: execute with a default test input
+          3. Sweep: try all test files in the repo
+          4. Craft: ask LLM to create a targeted malformed input
+          5. Run crafted input
+
+        Returns (output_text, success_bool).
+        """
+        parts = ["", "=" * 60, "AUTO-PIPELINE: .o compiled → link → run → sweep → craft", "=" * 60]
+        pipeline_log: dict[str, Any] = {}
+
+        # --- Step 1: Link ---
+        parts.append("\n📦 STEP 1: Linking...")
+        binary_exists = self.env.exec("test -x /work/harness && echo yes", timeout=5).stdout.strip() == "yes"
+
+        if not binary_exists:
+            # Try simple link first
+            harness_o = self.env.exec("ls /work/*.o 2>/dev/null | head -5", timeout=5).stdout.strip()
+            if not harness_o:
+                parts.append("  No .o files found in /work/")
+                return "\n".join(parts), False
+
+            obj_files = harness_o.split("\n")
+            objs = " ".join(f.strip() for f in obj_files if f.strip())
+
+            # Attempt 1: Direct link (no pipe — need real exit code)
+            link_r = self.env.exec(
+                f"g++ -fsanitize=address -g {objs} -o /work/harness -lpthread -ldl 2>&1",
+                timeout=60,
+            )
+
+            # Check if binary was actually created (exit code unreliable with pipes)
+            binary_created = self.env.exec(
+                "test -x /work/harness && echo yes", timeout=5,
+            ).stdout.strip() == "yes"
+
+            if not binary_created:
+                parts.append("  Direct link failed — resolving dependencies...")
+                if link_r.output:
+                    parts.append(f"  Link errors: {link_r.output[:500]}")
+                pipeline_log["direct_link_failed"] = True
+
+                # Use the existing linking hint machinery
+                resolve_output = self._generate_linking_hint()
+                parts.append(resolve_output[:2000])
+                pipeline_log["link_resolve"] = resolve_output[:2000]
+
+                binary_exists = self.env.exec(
+                    "test -x /work/harness && echo yes", timeout=5
+                ).stdout.strip() == "yes"
+            else:
+                parts.append("  ✅ Linked successfully: /work/harness")
+                binary_exists = True
+                pipeline_log["link_success"] = True
+
+        if not binary_exists:
+            parts.append("\n❌ Could not produce an executable. Returning to LLM.")
+            parts.append("You need to resolve the linking errors above.")
+            turn_log["pipeline"] = pipeline_log
+            return "\n".join(parts), False
+
+        # --- Step 2: Run with default input ---
+        parts.append("\n▶️  STEP 2: Running with test input...")
+        run_output = self._auto_run_harness()
+        parts.append(run_output)
+        pipeline_log["auto_run"] = run_output[:3000]
+
+        # Check for crash
+        if "ASAN ERROR DETECTED INSIDE THE LIBRARY" in run_output:
+            parts.append("\n🔴 VULNERABILITY CONFIRMED on default test input!")
+            result.success = True
+            result.harness_path = "/work/harness"
+            result.input_path = self._find_input_file()
+            vr = self._run_verification("/work/harness", result.input_path)
+            result.verification = vr
+            pipeline_log["confirmed"] = True
+            pipeline_log["step"] = "auto_run"
+            turn_log["pipeline"] = pipeline_log
+            return "\n".join(parts), True
+
+        # --- Step 3: Sweep test files ---
+        parts.append("\n🔍 STEP 3: Sweeping all test inputs in the repo...")
+        sweep_output = self._sweep_test_inputs()
+        parts.append(sweep_output)
+        pipeline_log["sweep"] = sweep_output[:3000]
+
+        if "ASAN ERROR DETECTED INSIDE THE LIBRARY" in sweep_output:
+            parts.append("\n🔴 VULNERABILITY CONFIRMED via input sweep!")
+            result.success = True
+            result.harness_path = "/work/harness"
+            # The crash input was copied to /work/crash_input by _sweep_test_inputs
+            result.input_path = "/work/crash_input"
+            vr = self._run_verification("/work/harness", "/work/crash_input")
+            result.verification = vr
+            pipeline_log["confirmed"] = True
+            pipeline_log["step"] = "sweep"
+            turn_log["pipeline"] = pipeline_log
+            return "\n".join(parts), True
+
+        # --- Step 4: Ask LLM to craft a targeted input ---
+        parts.append("\n🧠 STEP 4: Asking LLM to craft a targeted malformed input...")
+        craft_output, crafted_path = self._ask_llm_craft_input()
+        parts.append(craft_output)
+        pipeline_log["craft"] = craft_output[:3000]
+
+        if not crafted_path:
+            parts.append("\n⚠️ LLM could not craft an input. Returning to agent loop.")
+            turn_log["pipeline"] = pipeline_log
+            return "\n".join(parts), False
+
+        # --- Step 5: Run with crafted input ---
+        parts.append(f"\n▶️  STEP 5: Running with crafted input {crafted_path}...")
+        run_r = self.env.exec(
+            f"timeout 20 /work/harness {crafted_path} 2>&1", timeout=30,
+        )
+        parts.append(f"  exit_code={run_r.exit_code}")
+        craft_run_output = run_r.output or ""
+        parts.append(craft_run_output[:2000])
+        pipeline_log["craft_run_exit"] = run_r.exit_code
+        pipeline_log["craft_run_output"] = craft_run_output[:2000]
+
+        if "AddressSanitizer" in craft_run_output and "/src/" in craft_run_output:
+            parts.append("\n🔴 VULNERABILITY CONFIRMED with crafted input!")
+            result.success = True
+            result.harness_path = "/work/harness"
+            result.input_path = crafted_path
+            vr = self._run_verification("/work/harness", crafted_path)
+            result.verification = vr
+            pipeline_log["confirmed"] = True
+            pipeline_log["step"] = "crafted_input"
+            turn_log["pipeline"] = pipeline_log
+            return "\n".join(parts), True
+
+        # --- No crash found — return to LLM with all context ---
+        parts.append("\n" + "=" * 60)
+        parts.append("AUTO-PIPELINE COMPLETE — no crash found yet.")
+        parts.append("The harness compiled and linked. It runs without crashing.")
+        parts.append("")
+        parts.append("WHAT TO DO NEXT:")
+        parts.append("1. Modify the harness to exercise MORE of the vulnerability trace")
+        parts.append("2. Add API calls that follow the exact data flow from the trace")
+        parts.append("3. Try different input mutations — truncate, corrupt headers, flip bits")
+        parts.append("4. When you have a crash, use <submit> to verify it")
+
+        turn_log["pipeline"] = pipeline_log
+        return "\n".join(parts), False
+
+    def _find_input_file(self) -> str:
+        """Find the best available input file."""
+        r = self.env.exec(
+            "ls /work/crash_input /work/crafted_input.* /work/input.pdf "
+            "/work/input.* 2>/dev/null | head -1", timeout=5,
+        )
+        return r.stdout.strip().split("\n")[0] if r.stdout.strip() else "/work/input.pdf"
+
+    def _ask_llm_craft_input(self) -> tuple[str, str]:
+        """Craft a malformed input based on deep analysis of the vulnerability trace.
+
+        Reads actual source code at critical trace points, uses Z3 constraints,
+        examines existing test files for format clues, and builds a
+        vulnerability-class-specific crafting prompt.
+
+        Returns (description, path_to_crafted_file) or (description, "").
+        """
+        parts_log = []  # human-readable log of what we found
+
+        # --- 1. Analyze the trace in depth ---
+        vuln_context = self._build_vuln_craft_context()
+        parts_log.append(vuln_context["summary"])
+
+        # --- 2. Examine an existing test file to understand the format ---
+        format_info = self._analyze_input_format()
+        parts_log.append(f"Input format: {format_info['format']}")
+        if format_info.get("hex_header"):
+            parts_log.append(f"File header (hex): {format_info['hex_header']}")
+
+        # --- 3. Build the crafting prompt ---
+        craft_prompt = self._build_craft_prompt(vuln_context, format_info)
+
+        # --- 4. Call LLM ---
+        try:
+            response = self.llm_code(
+                "You are a security researcher crafting malformed inputs to trigger "
+                "specific vulnerabilities. You write Python scripts that generate "
+                "binary files. Respond with ONLY <shell> tags containing commands.",
+                craft_prompt,
+            )
+        except Exception as exc:
+            return f"LLM craft call failed: {exc}", ""
+
+        # --- 5. Parse and execute ---
+        actions = parse_actions(response)
+
+        # First, execute any write_file actions (the script)
+        for a in actions:
+            if a.kind == "write_file" and a.path:
+                wr = self.env.write_file(a.path, a.content)
+                if wr.success:
+                    parts_log.append(f"  Wrote {len(a.content)} bytes to {a.path}")
+                else:
+                    parts_log.append(f"  Failed to write {a.path}: {wr.stderr}")
+
+        shell_actions = [a for a in actions if a.kind == "shell"]
+
+        # Fallback: extract python from response
+        if not shell_actions:
+            # Try python3 -c '...'
+            m = re.search(r"python3\s+-c\s+'(.*?)'", response, re.DOTALL)
+            if not m:
+                m = re.search(r'python3\s+-c\s+"(.*?)"', response, re.DOTALL)
+            if not m:
+                # Try python3 << 'EOF' or just a code block
+                m = re.search(r"```(?:python)?\s*\n(.*?)\n```", response, re.DOTALL)
+                if m:
+                    self.env.write_file("/work/craft_input.py", m.group(1))
+                    shell_actions = [AgentAction(kind="shell", content="python3 /work/craft_input.py")]
+            if m and not shell_actions:
+                shell_actions = [AgentAction(kind="shell", content=f"python3 -c '{m.group(1)}'")]
+
+        # If we wrote a script but have no shell action, add one
+        if not shell_actions:
+            script_check = self.env.exec("test -f /work/craft_input.py && echo yes", timeout=5)
+            if script_check.stdout.strip() == "yes":
+                shell_actions = [AgentAction(kind="shell", content="python3 /work/craft_input.py")]
+
+        if not shell_actions:
+            parts_log.append(f"LLM did not produce executable code.\nResponse:\n{response[:800]}")
+            return "\n".join(parts_log), ""
+
+        # Execute crafting commands
+        crafted_path = ""
+        for sa in shell_actions[:3]:
+            # If the command is too long for inline, write as script
+            if len(sa.content) > 500 and "python3 -c" in sa.content:
+                code = sa.content.replace("python3 -c '", "", 1)
+                if code.endswith("'"):
+                    code = code[:-1]
+                self.env.write_file("/work/craft_input.py", code)
+                sa = AgentAction(kind="shell", content="python3 /work/craft_input.py")
+
+            exec_r = self.env.exec(sa.content, timeout=30)
+            parts_log.append(f"  $ {sa.content[:200]}")
+            parts_log.append(f"  exit_code={exec_r.exit_code}")
+            if exec_r.output.strip():
+                parts_log.append(f"  {exec_r.output[:500]}")
+
+            if exec_r.exit_code == 0:
+                check = self.env.exec(
+                    "ls -la /work/crafted_input.* /work/crafted_input 2>/dev/null | head -3",
+                    timeout=5,
+                )
+                if check.stdout.strip():
+                    crafted_path = check.stdout.strip().split("\n")[0].split()[-1]
+                    parts_log.append(f"  ✅ Created: {crafted_path}")
+                    break
+            else:
+                # If python fails, try fixing common issues and retry
+                if "SyntaxError" in (exec_r.output or ""):
+                    parts_log.append("  Syntax error — writing as script file instead")
+                    code = sa.content
+                    if "python3 -c" in code:
+                        code = code.split("python3 -c", 1)[1].strip().strip("'\"")
+                    self.env.write_file("/work/craft_input.py", code)
+                    exec_r2 = self.env.exec("python3 /work/craft_input.py", timeout=30)
+                    if exec_r2.exit_code == 0:
+                        check = self.env.exec(
+                            "ls -la /work/crafted_input.* 2>/dev/null | head -1", timeout=5,
+                        )
+                        if check.stdout.strip():
+                            crafted_path = check.stdout.strip().split()[-1]
+                            parts_log.append(f"  ✅ Created via script: {crafted_path}")
+                            break
+
+        return "\n".join(parts_log), crafted_path
+
+    def _build_vuln_craft_context(self) -> dict[str, Any]:
+        """Build rich vulnerability context from the trace for input crafting."""
+        ctx: dict[str, Any] = {}
+
+        # Basic info
+        tags = self.trace.vulnerability_tags or []
+        ctx["tags"] = tags
+        ctx["vuln_class"] = tags[0] if tags else "unknown"
+        ctx["sink_function"] = self.sink_function
+        ctx["sink_file"] = self.sink_file
+        ctx["vuln_summary"] = self.trace.vulnerability_summary or ""
+        ctx["llm_rationale"] = self.trace.llm_rationale or ""
+
+        # Z3 constraints — what values make the path feasible
+        ctx["constraints"] = self.trace.constraints[:10] if self.trace.constraints else []
+        ctx["z3_model"] = self.trace.z3_model or ""
+
+        # Read source code at critical points in the trace
+        source_contexts: list[str] = []
+        key_functions: list[str] = []
+        key_variables: list[str] = []
+        entry_point_code = ""
+
+        for i, step in enumerate(self.trace.steps[:20]):
+            loc = step.location
+            if not loc or not loc.file:
+                continue
+
+            # Read source at first step (entry point), sink, and
+            # steps with interesting operations
+            is_entry = (i == 0)
+            is_sink = (i == len(self.trace.steps) - 1)
+            is_interesting = step.edge_kind and step.edge_kind.value in (
+                "call", "pointer_deref", "type_cast", "param_pass",
+            )
+
+            if is_entry or is_sink or is_interesting:
+                src = self.env.exec(
+                    f"sed -n '{max(1, loc.line - 8)},{loc.line + 8}p' /src/{loc.file} 2>/dev/null",
+                    timeout=5,
+                )
+                if src.success and src.stdout.strip():
+                    label = "ENTRY" if is_entry else ("SINK" if is_sink else f"Step {i}")
+                    source_contexts.append(
+                        f"--- {label}: {loc.file}:{loc.line} ---\n{src.stdout.strip()}"
+                    )
+                    if is_entry:
+                        entry_point_code = src.stdout.strip()
+
+            # Collect function names and variable names from snippets
+            if step.node_name and len(step.node_name) > 2:
+                name = step.node_name.split("|")[0].strip()
+                if name and not name.startswith("<"):
+                    key_functions.append(name)
+
+            # Extract variable names from code snippets
+            snippet = step.code_snippet or ""
+            for var_match in re.finditer(r'\b([a-zA-Z_]\w{2,})\b', snippet):
+                v = var_match.group(1)
+                if v not in ("int", "char", "void", "return", "const", "sizeof",
+                             "NULL", "nullptr", "true", "false", "include"):
+                    key_variables.append(v)
+
+        ctx["source_contexts"] = source_contexts
+        ctx["key_functions"] = list(dict.fromkeys(key_functions))[:15]  # dedupe
+        ctx["key_variables"] = list(dict.fromkeys(key_variables))[:20]
+        ctx["entry_point_code"] = entry_point_code
+
+        # Build a trace summary with annotations
+        trace_lines = []
+        for i, step in enumerate(self.trace.steps[:20]):
+            loc = f"{step.location.file}:{step.location.line}" if step.location else "?"
+            edge = f" [{step.edge_kind.value}]" if step.edge_kind else ""
+            annotation = f" — {step.annotation}" if step.annotation else ""
+            snippet = step.code_snippet or "?"
+            trace_lines.append(f"  Step {i}: {loc}{edge} | {snippet[:100]}{annotation}")
+        ctx["trace_text"] = "\n".join(trace_lines)
+
+        # Build human summary
+        summary_parts = [f"Vulnerability: {ctx['vuln_class']}"]
+        summary_parts.append(f"Sink: {self.sink_function} at {self.sink_file}")
+        if ctx["vuln_summary"]:
+            summary_parts.append(f"Summary: {ctx['vuln_summary'][:200]}")
+        if ctx["z3_model"]:
+            summary_parts.append(f"Z3 satisfying values: {ctx['z3_model']}")
+        if ctx["constraints"]:
+            summary_parts.append(f"Path constraints: {'; '.join(ctx['constraints'][:5])}")
+        ctx["summary"] = "\n".join(summary_parts)
+
+        return ctx
+
+    def _analyze_input_format(self) -> dict[str, str]:
+        """Examine existing test files and harness to determine input format."""
+        info: dict[str, str] = {"format": "binary", "hex_header": "", "sample_path": ""}
+
+        # Read the harness to determine what format it expects
+        harness_src = self.env.read_file("/work/harness.cpp", max_lines=100)
+        harness_lower = harness_src.lower()
+
+        # Detect format from harness includes and API calls
+        format_map = [
+            (("fpdf", "pdf", "loadmemdocument", "loadpage"), "PDF", ".pdf"),
+            (("cms", "lcms", "cmsit8", "cgats", "icc", "cmsopenprofile"), "CGATS/ICC", ".it8"),
+            (("xml", "parsexml", "xmlparse", "expat"), "XML", ".xml"),
+            (("png", "read_png", "png_sig"), "PNG", ".png"),
+            (("jpeg", "jpg", "jpegsrc", "decompress"), "JPEG", ".jpg"),
+            (("tiff", "tif", "readtiff"), "TIFF", ".tif"),
+            (("json", "json_parse", "rapidjson"), "JSON", ".json"),
+            (("font", "truetype", "opentype", "woff", "otf"), "Font", ".ttf"),
+        ]
+
+        ext = ".bin"
+        for keywords, fmt_name, fmt_ext in format_map:
+            if any(k in harness_lower for k in keywords):
+                info["format"] = fmt_name
+                ext = fmt_ext
+                break
+
+        # Find and examine a sample test file
+        find_r = self.env.exec(
+            f"find /src/testing /src/test /src/tests /src/resources "
+            f"-type f -name '*{ext}' 2>/dev/null | head -1",
+            timeout=10,
+        )
+        sample_path = find_r.stdout.strip().split("\n")[0] if find_r.stdout.strip() else ""
+
+        if not sample_path:
+            # Try broader search
+            find_r = self.env.exec(
+                "find /src -type f \\( -name '*.pdf' -o -name '*.it8' -o -name '*.icc' "
+                "-o -name '*.xml' -o -name '*.png' \\) 2>/dev/null | head -1",
+                timeout=10,
+            )
+            sample_path = find_r.stdout.strip().split("\n")[0] if find_r.stdout.strip() else ""
+
+        if sample_path:
+            info["sample_path"] = sample_path
+            # Read first 64 bytes as hex
+            hex_r = self.env.exec(f"xxd -l 64 {sample_path} 2>/dev/null", timeout=5)
+            if hex_r.success:
+                info["hex_header"] = hex_r.stdout.strip()
+
+            # Get file size
+            size_r = self.env.exec(f"stat -c %s {sample_path} 2>/dev/null", timeout=5)
+            if size_r.success:
+                info["sample_size"] = size_r.stdout.strip()
+
+        info["ext"] = ext
+        return info
+
+    def _build_craft_prompt(
+        self,
+        vuln_ctx: dict[str, Any],
+        format_info: dict[str, str],
+    ) -> str:
+        """Build a detailed, vulnerability-specific prompt for input crafting."""
+        vuln_class = vuln_ctx["vuln_class"]
+        fmt = format_info["format"]
+        ext = format_info.get("ext", ".bin")
+        out_path = f"/work/crafted_input{ext}"
+
+        # Vulnerability-class-specific guidance
+        class_guidance = {
+            "buffer_overflow": (
+                "STRATEGY: Find a length/size field in the input format and set it to a "
+                "very large value, while providing less actual data. The parser will allocate "
+                "a buffer based on the declared size but read past it.\n"
+                "- If there's a string length field: set it to 0xFFFF or larger\n"
+                "- If there's an array count: set it to a huge number\n"
+                "- If there's a record size: make it bigger than the file"
+            ),
+            "use_after_free": (
+                "STRATEGY: Create an input that forces the parser to free an object "
+                "and then reference it again. Common triggers:\n"
+                "- Circular references in the object graph\n"
+                "- A reference to an object that was already processed and freed\n"
+                "- A cross-reference table pointing to a freed object\n"
+                "- Duplicate entries that cause double-processing"
+            ),
+            "null_deref": (
+                "STRATEGY: Create an input with missing or null fields that the parser "
+                "dereferences without checking.\n"
+                "- Remove required fields/objects entirely\n"
+                "- Set object references to null/0/empty\n"
+                "- Provide an empty container where the parser expects content"
+            ),
+            "integer_overflow": (
+                "STRATEGY: Find numeric fields and set them to boundary values.\n"
+                "- Width × height × bpp that overflows 32-bit: e.g., 65536 × 65536 × 4\n"
+                "- Count fields near UINT32_MAX (0xFFFFFFFF) or INT32_MAX (0x7FFFFFFF)\n"
+                "- Negative values in signed fields that become huge when cast to unsigned"
+            ),
+            "type_confusion": (
+                "STRATEGY: Change a type tag/identifier to make the parser treat an "
+                "object as a different type.\n"
+                "- Change object type markers in the file\n"
+                "- Put one object type where another is expected\n"
+                "- Modify type/class ID fields"
+            ),
+            "format_string": (
+                "STRATEGY: Insert format specifiers (%s, %x, %n) into string fields "
+                "that the parser passes to printf-like functions."
+            ),
+        }
+
+        guidance = class_guidance.get(vuln_class, (
+            "STRATEGY: Corrupt the input structure to exercise the code path in the trace. "
+            "Look at what the entry point reads and what the sink expects, and break the "
+            "assumptions between them."
+        ))
+
+        # Build source context section
+        source_section = ""
+        if vuln_ctx["source_contexts"]:
+            source_section = "\nSOURCE CODE AT CRITICAL POINTS:\n" + "\n\n".join(
+                vuln_ctx["source_contexts"][:5]
+            )
+
+        # Build constraints section
+        constraints_section = ""
+        if vuln_ctx["constraints"]:
+            constraints_section = (
+                "\nPATH CONSTRAINTS (conditions that must be true to reach the sink):\n"
+                + "\n".join(f"  • {c}" for c in vuln_ctx["constraints"][:8])
+            )
+        if vuln_ctx["z3_model"]:
+            constraints_section += (
+                f"\n\nZ3 SATISFYING VALUES (concrete values that make the path feasible):\n"
+                f"  {vuln_ctx['z3_model']}"
+            )
+
+        # Build format section
+        format_section = f"INPUT FORMAT: {fmt}\n"
+        if format_info.get("sample_path"):
+            format_section += f"Sample file: {format_info['sample_path']}\n"
+        if format_info.get("sample_size"):
+            format_section += f"Sample size: {format_info['sample_size']} bytes\n"
+        if format_info.get("hex_header"):
+            format_section += f"File header:\n{format_info['hex_header']}\n"
+
+        harness_src = self.env.read_file("/work/harness.cpp", max_lines=60)
+
+        prompt = f"""Craft a malformed {fmt} file to trigger a {vuln_class} vulnerability.
+
+VULNERABILITY DETAILS:
+  Class: {vuln_class}
+  Sink: {vuln_ctx['sink_function']} at {vuln_ctx['sink_file']}
+  {vuln_ctx.get('vuln_summary', '')}
+  {vuln_ctx.get('llm_rationale', '')}
+
+DATA FLOW TRACE (how input reaches the vulnerable code):
+{vuln_ctx['trace_text']}
+{source_section}
+{constraints_section}
+
+KEY FUNCTIONS IN THE TRACE: {', '.join(vuln_ctx['key_functions'][:10])}
+KEY VARIABLES: {', '.join(vuln_ctx['key_variables'][:10])}
+
+{format_section}
+
+HARNESS (what the binary does with the input):
+{harness_src[:1500]}
+
+{guidance}
+
+TASK: Write a Python script that creates {out_path}.
+
+REQUIREMENTS:
+1. The file must be a valid-enough {fmt} that the parser starts processing it
+2. BUT it must be malformed in the specific way that triggers the {vuln_class}
+3. If a sample file exists, start from it and mutate the critical bytes
+4. The script must write to {out_path}
+
+{"If a sample file exists at " + format_info['sample_path'] + ", you can read it and mutate specific bytes." if format_info.get('sample_path') else "Build the file from scratch using the format specification."}
+
+Write ONLY the Python script inside a <shell> tag:
+<shell>python3 /work/craft_input.py</shell>
+
+But first write the script:
+<write_file path="/work/craft_input.py">
+import struct
+# Your crafting code here — write to {out_path}
+</write_file>"""
+
+        return prompt
+
+    # ------------------------------------------------------------------
+    # Post-mortem analysis
+    # ------------------------------------------------------------------
+
+    def _generate_postmortem(self, result: AgentResult) -> dict[str, Any]:
+        """Generate a detailed failure analysis when the agent doesn't succeed.
+
+        Inspects the Docker container state, summarizes what was attempted,
+        and asks the LLM to explain why it failed and what should be done
+        differently.
+        """
+        pm: dict[str, Any] = {
+            "turns_used": result.turns_used,
+            "total_actions": result.total_actions,
+            "elapsed_seconds": result.elapsed_seconds,
+        }
+
+        # --- 1. Inspect container state ---
+        if self.env.is_running:
+            # Check if harness exists and is compiled
+            harness_check = self.env.exec(
+                "ls -la /work/harness* /work/*.cpp /work/*.c 2>/dev/null", timeout=5,
+            )
+            pm["harness_files"] = harness_check.stdout.strip() if harness_check.success else ""
+
+            # Check if harness is executable
+            exec_check = self.env.exec("test -x /work/harness && echo COMPILED || echo NOT_COMPILED", timeout=5)
+            pm["harness_compiled"] = "COMPILED" in exec_check.stdout
+
+            # Check what inputs exist
+            input_check = self.env.exec(
+                "ls -la /work/input* /work/seed* /work/crash* /work/*.pdf /work/*.xml 2>/dev/null",
+                timeout=5,
+            )
+            pm["input_files"] = input_check.stdout.strip() if input_check.success else ""
+
+            # If harness exists, read it
+            if pm["harness_compiled"]:
+                harness_src = self.env.exec("cat /work/harness.cpp 2>/dev/null | head -80", timeout=5)
+                pm["harness_source"] = harness_src.stdout[:3000] if harness_src.success else ""
+
+                # Try running it to capture what happens
+                input_file = ""
+                if pm["input_files"]:
+                    input_file = pm["input_files"].split("\n")[0].split()[-1]
+                if input_file:
+                    run_r = self.env.exec(f"timeout 10 /work/harness {input_file} 2>&1", timeout=15)
+                    pm["last_run_exit_code"] = run_r.exit_code
+                    pm["last_run_output"] = run_r.output[:2000] if run_r.output else ""
+                else:
+                    pm["last_run_exit_code"] = None
+                    pm["last_run_output"] = "No input file found"
+
+            # Check for compilation errors
+            compile_check = self.env.exec(
+                "g++ -fsanitize=address -g -std=c++20 -I/src -I/src/public "
+                "/work/harness.cpp -c -o /dev/null 2>&1",
+                timeout=30,
+            )
+            has_errors = "error:" in (compile_check.stdout or "")
+            pm["compile_errors"] = compile_check.stdout[:2000] if has_errors else ""
+
+        # --- 2. Classify failure mode ---
+        if not pm.get("harness_files"):
+            pm["failure_mode"] = "NO_HARNESS"
+            pm["failure_summary"] = "Agent never wrote a harness file"
+        elif not pm.get("harness_compiled"):
+            pm["failure_mode"] = "COMPILE_FAILED"
+            pm["failure_summary"] = "Harness was written but never compiled successfully"
+        elif not pm.get("input_files"):
+            pm["failure_mode"] = "NO_INPUT"
+            pm["failure_summary"] = "Harness compiled but no test input was created/found"
+        elif pm.get("last_run_exit_code") == 0:
+            pm["failure_mode"] = "NO_CRASH"
+            pm["failure_summary"] = "Harness compiled and ran but produced no crash"
+        elif pm.get("last_run_output") and "AddressSanitizer" in pm["last_run_output"]:
+            if "/work/" in pm["last_run_output"] and "/src/" not in pm["last_run_output"]:
+                pm["failure_mode"] = "HARNESS_BUG"
+                pm["failure_summary"] = "ASAN crash in harness code, not in the library"
+            else:
+                pm["failure_mode"] = "CRASH_NOT_VERIFIED"
+                pm["failure_summary"] = "ASAN crash detected but verification didn't confirm it"
+        else:
+            pm["failure_mode"] = "UNKNOWN"
+            pm["failure_summary"] = "Agent ran out of budget without clear progress"
+
+        # --- 3. Count what was attempted ---
+        shell_count = 0
+        write_count = 0
+        compile_count = 0
+        run_count = 0
+        stall_count = 0
+        for entry in result.log:
+            if entry.get("event") != "turn":
+                continue
+            if entry.get("stall_detected"):
+                stall_count += 1
+            for ar in entry.get("action_results", []):
+                if ar.get("kind") == "shell":
+                    shell_count += 1
+                    cmd = ar.get("command", "")
+                    if any(c in cmd for c in ("g++", "gcc", "clang", "make", "cmake")):
+                        compile_count += 1
+                    if "/work/harness" in cmd and "." not in cmd.split("/")[-1]:
+                        run_count += 1
+                elif ar.get("kind") == "write_file":
+                    write_count += 1
+
+        pm["action_summary"] = {
+            "shell_commands": shell_count,
+            "files_written": write_count,
+            "compile_attempts": compile_count,
+            "run_attempts": run_count,
+            "stalls_detected": stall_count,
+        }
+
+        # --- 4. Ask LLM for analysis ---
+        try:
+            # Build a condensed timeline for the LLM
+            timeline = []
+            for entry in result.log:
+                if entry.get("event") != "turn":
+                    continue
+                turn_num = entry.get("turn", "?")
+                phase = entry.get("phase", "?")
+                actions = entry.get("actions_parsed", [])
+                action_str = ", ".join(a.get("kind", "?") for a in actions) if actions else "no actions"
+
+                summary_line = f"Turn {turn_num} [{phase}]: {action_str}"
+
+                if entry.get("stall_detected"):
+                    summary_line += " [STALL]"
+                if entry.get("force_resolve_succeeded"):
+                    summary_line += " [FORCE-RESOLVE OK]"
+                if entry.get("auto_run_crash"):
+                    summary_line += " [AUTO-RUN CRASH]"
+
+                # Add first error or key result
+                for ar in entry.get("action_results", []):
+                    if ar.get("kind") == "shell" and ar.get("exit_code", 0) != 0:
+                        err = ar.get("output", "")[:100]
+                        summary_line += f" → error: {err}"
+                        break
+
+                timeline.append(summary_line)
+
+            timeline_str = "\n".join(timeline[-30:])  # last 30 turns
+
+            llm_prompt = f"""An exploit agent tried to trigger a vulnerability but FAILED after {result.turns_used} turns.
+
+TARGET:
+  Sink: {self.sink_file} → {self.sink_function}
+  Tags: {', '.join(self.trace.vulnerability_tags or [])}
+  Repo: {self.profile.repo_name} ({self.profile.language}, build: {self.profile.build_system})
+
+FAILURE MODE: {pm['failure_mode']} — {pm['failure_summary']}
+
+ACTION SUMMARY:
+  Shell commands: {shell_count}
+  Files written: {write_count}
+  Compile attempts: {compile_count}
+  Run attempts: {run_count}
+  Stalls detected: {stall_count}
+
+TIMELINE (last 30 turns):
+{timeline_str}
+
+HARNESS SOURCE (if any):
+{pm.get('harness_source', '(no harness written)')[:2000]}
+
+LAST RUN OUTPUT:
+exit_code={pm.get('last_run_exit_code', 'N/A')}
+{pm.get('last_run_output', '(never ran)')[:1500]}
+
+COMPILE ERRORS (if any):
+{pm.get('compile_errors', '(none)')[:1000]}
+
+Analyze this failure. Answer EXACTLY these questions:
+
+1. WHAT HAPPENED: What did the agent actually achieve? (1-2 sentences)
+2. WHERE IT GOT STUCK: At what point did progress stop? (1-2 sentences)
+3. ROOT CAUSE: Why did it fail? (2-3 sentences, be specific)
+4. HARNESS QUALITY: Is the harness correct? Does it exercise the right code path? If not, what's wrong?
+5. INPUT QUALITY: Were the right inputs tried? What input would be needed?
+6. WHAT TO TRY NEXT: Concrete steps to succeed next time (3-5 bullet points)
+7. DIFFICULTY ASSESSMENT: How hard is this exploit? (easy/medium/hard/requires-prebuilt-image)
+"""
+
+            llm_analysis = self.llm_explore(
+                "You are a security expert analyzing why an exploit agent failed.",
+                llm_prompt,
+            )
+            pm["llm_analysis"] = llm_analysis
+
+            # Parse structured fields from LLM response
+            for field_name in ("WHAT HAPPENED", "WHERE IT GOT STUCK", "ROOT CAUSE",
+                               "HARNESS QUALITY", "INPUT QUALITY", "WHAT TO TRY NEXT",
+                               "DIFFICULTY ASSESSMENT"):
+                m = re.search(
+                    rf'(?:^|\n)\s*\d*\.?\s*{re.escape(field_name)}[:\s]+(.*?)(?=\n\s*\d*\.?\s*(?:WHAT|WHERE|ROOT|HARNESS|INPUT|WHAT TO|DIFFICULTY)|\Z)',
+                    llm_analysis, re.DOTALL | re.IGNORECASE,
+                )
+                if m:
+                    pm[field_name.lower().replace(" ", "_")] = m.group(1).strip()
+
+        except Exception as exc:
+            logger.warning("Post-mortem LLM call failed: %s", exc)
+            pm["llm_analysis"] = f"(LLM analysis unavailable: {exc})"
+
+        logger.info("Post-mortem: %s — %s", pm["failure_mode"], pm["failure_summary"])
+        return pm
+
+    # ------------------------------------------------------------------
+    # Context building
+    # ------------------------------------------------------------------
+
+    def _build_initial_context(self) -> str:
+        """Build the initial context with repo profile + trace + pre-seeded exploration."""
+        p = self.profile
+
+        # Pre-seed: run initial exploration commands so the LLM already has info
+        exploration = ""
+        if self.env.is_running:
+            cmds = [
+                "ls /src/ | head -30",
+                "find /src -maxdepth 1 -name 'README*' -o -name 'BUILD*' -o -name 'Makefile' -o -name 'CMakeLists.txt' -o -name 'Cargo.toml' -o -name 'meson.build' | head -10",
+                "find /src -path '*/public/*.h' -o -path '*/include/*.h' | head -15",
+                "find /src -name '*fuzz*' -o -name '*fuzzer*' | head -10",
+                "find /src/testing -name '*.pdf' -o -name '*.xml' -o -name '*.json' 2>/dev/null | head -10",
+            ]
+            parts = []
+            for cmd in cmds:
+                r = self.env.exec(cmd, timeout=15)
+                if r.stdout.strip():
+                    parts.append(f"$ {cmd}\n{r.stdout.strip()[:1000]}")
+            exploration = "\n\n".join(parts)
+
+        ctx_parts = [
+            "=== REPOSITORY INFO ===",
+            f"Name: {p.repo_name}",
+            f"Language: {p.language}",
+            f"Build system: {p.build_system or 'unknown'}",
+        ]
+        if p.build_commands:
+            ctx_parts.append("Build hints (may need adaptation):")
+            for cmd in p.build_commands:
+                ctx_parts.append(f"  $ {cmd}")
+
+        ctx_parts += [
+            "",
+            "=== VULNERABILITY TRACE ===",
+            f"Sink function: {self.sink_function}",
+            f"Sink file: {self.sink_file}",
+            f"Tags: {', '.join(self.trace.vulnerability_tags or [])}",
+            "",
+            "Steps:",
+        ]
+        for i, step in enumerate(self.trace.steps[:20]):  # cap at 20 steps
+            loc = step.location
+            loc_str = f"{loc.file}:{loc.line}" if loc else "?"
+            sink = " [SINK]" if i == len(self.trace.steps) - 1 else ""
+            ctx_parts.append(f"  {i}{sink}: {loc_str} — {(step.code_snippet or '?')[:100]}")
+
+        if exploration:
+            ctx_parts += [
+                "",
+                "=== INITIAL EXPLORATION (already executed for you) ===",
+                exploration,
+            ]
+
+        ctx_parts += [
+            "",
+            "=== START ===",
+            "Based on the exploration above, emit your first <shell> commands.",
+            "Good first steps: read the build config, check existing fuzz harnesses,",
+            "or look at the public API headers.",
+            "",
+            "Remember: use <shell>command</shell> tags. I execute them and show you output.",
+        ]
+
+        return "\n".join(ctx_parts)
+
+    def _build_prompt(self, initial_context: str) -> str:
+        """Build the full user prompt with conversation history."""
+        parts = [initial_context]
+
+        # Add recent exchanges (sliding window)
+        window = self._exchanges[-self.config.context_window:]
+        for i, (assistant, results) in enumerate(window):
+            turn_num = len(self._exchanges) - len(window) + i + 1
+            parts.append(f"\n--- Turn {turn_num} ---")
+            # Truncate assistant response to save context
+            parts.append(f"[You said]:\n{assistant[:1500]}")
+            parts.append(f"[Output]:\n{results[:2000]}")
+
+        if self._exchanges:
+            parts.append(
+                "\n--- Your next turn ---\n"
+                "Emit <shell> or <write_file> commands based on the output above.\n"
+                "Do NOT repeat previous commands that already succeeded."
+            )
+
+        return "\n\n".join(parts)
+
+    def _transition_to_code(self, result: AgentResult) -> None:
+        """Transition from exploration phase to coding phase.
+
+        Builds a summary of what was discovered and resets the exchange
+        history so the coder model starts with a clean context.
+        """
+        logger.info("=== Phase transition: EXPLORE → CODE ===")
+        result.log.append({
+            "role": "system",
+            "content": f"Phase transition: explore → code. Summary: {self._exploration_summary[:500]}",
+        })
+
+        # Save exploration exchanges for the summary, then reset
+        explore_exchanges = self._exchanges[:]
+        self._exchanges.clear()
+
+        self._phase = "code"
+
+    def _build_coder_prompt(self, initial_context: str) -> str:
+        """Build prompt for the coder model with exploration summary."""
+        parts = []
+
+        # Compact version of initial context (repo info + trace)
+        parts.append(initial_context)
+
+        # Exploration summary
+        parts.append("\n=== EXPLORATION SUMMARY ===")
+        parts.append(self._exploration_summary or "(no summary provided)")
+
+        # Key findings from exploration exchanges we saved
+        # Include the last few exploration results as concrete data
+        if not self._exchanges:
+            # First coder turn — give it the raw exploration data
+            parts.append("\n=== KEY FINDINGS FROM EXPLORATION ===")
+            parts.append(
+                "The explorer phase gathered the information above. "
+                "Now write a harness, compile it, and iterate.\n"
+                "Start by writing /work/harness.cpp with <write_file>."
+            )
+        else:
+            # Subsequent coder turns — show recent exchanges
+            window = self._exchanges[-self.config.context_window:]
+            for i, (assistant, results) in enumerate(window):
+                turn_num = len(self._exchanges) - len(window) + i + 1
+                parts.append(f"\n--- Turn {turn_num} ---")
+                parts.append(f"[You said]:\n{assistant[:1500]}")
+                parts.append(f"[Output]:\n{results[:2000]}")
+
+            parts.append(
+                "\n--- Your next turn ---\n"
+                "Continue from where you left off. Emit <shell> or <write_file> commands.\n"
+                "Do NOT repeat commands that already succeeded."
+            )
+
+        return "\n\n".join(parts)
+
+    # ------------------------------------------------------------------
+    # Verification
+    # ------------------------------------------------------------------
+
+    def _run_verification(self, binary: str, input_file: str) -> VerificationResult:
+        """Run GDB-based verification on the harness."""
+        return verify_harness(
+            env=self.env,
+            harness_binary=binary,
+            input_file=input_file,
+            sink_function=self.sink_function,
+            sink_file=self.sink_file,
+            library_name=self.profile.library_name,
+            timeout=self.config.verify_timeout,
+        )
